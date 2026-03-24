@@ -1,0 +1,13 @@
+httpx
+playwright
+beautifulsoup4
+asyncpg
+psycopg2-binary
+anthropic
+python-dotenv
+fastapi
+uvicorn
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+supabase
