@@ -828,10 +828,8 @@ async def fix_error(frame, field_id: str, error_text: str, profile_text: str = N
 
 async def fill_react_select(frame, field_id: str, value: str = None, label: str = "", profile_text: str = None):
     try:
-        if field_id.isdigit():
-            el = frame.locator(f"[id='{field_id}']")
-        else:
-            el = frame.locator(f"#{field_id}")
+        # Always use attribute selector — [] and special chars in IDs break CSS # selectors
+        el = frame.locator(f"[id='{field_id}']")
 
         if await el.count() == 0 or not await el.is_visible():
             return False
@@ -893,6 +891,8 @@ CRITICAL RULES:
 6. For country/residence/location questions: pick the option that matches the candidate's country (from the "Country:" line in their profile — usually "United States").
 7. For sponsorship/visa/work permit questions: if work_auth is 'citizen' or 'authorized', pick "No".
 8. If unsure, pick the most neutral or positive option from the list.
+9. For school/university/institution dropdowns: find the closest matching school name in the list. If the exact school is not listed, pick "Other" or the closest partial match. NEVER explain — just pick one option.
+10. YOU MUST PICK ONE OPTION FROM THE LIST. If nothing matches, pick "Other" or the first option. NEVER return an explanation.
 """
         try:
             message = client.messages.create(
@@ -906,6 +906,17 @@ CRITICAL RULES:
             print(f"    ✗ AI error: {e}")
             # Fall back to first non-empty option
             ai_choice = option_texts[0] if option_texts else ""
+
+        if not ai_choice:
+            await el.press("Escape")
+            return False
+
+        # If AI returned a long explanation instead of a valid option, use fallback
+        if len(ai_choice) > 120 or ai_choice.lower().startswith("i cannot") or "not in the" in ai_choice.lower():
+            # Try to find "Other" first, else use first option
+            fallback = next((t for t in option_texts if "other" in t.lower()), option_texts[0] if option_texts else None)
+            print(f"    ⚠ AI gave explanation instead of option — falling back to: {fallback!r}")
+            ai_choice = fallback or ""
 
         if not ai_choice:
             await el.press("Escape")
