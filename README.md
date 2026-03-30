@@ -1,4 +1,4 @@
-# Job Bot
+# APPLYAGENT
 
 Job discovery and scoring bot. Scrapes Greenhouse, scores jobs with a **keyword matcher** (multi-user ready), and stores data in **PostgreSQL** (Supabase).
 
