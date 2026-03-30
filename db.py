@@ -134,18 +134,20 @@ async def insert_jobs_batch(jobs: list[dict]):
         )
 
 
-async def get_unscored_jobs(user_id: int, rescore: bool = False):
+async def get_unscored_jobs(user_id: int, rescore: bool = False, limit: int = 100):
     pool = await get_pool()
     async with pool.acquire() as conn:
         if rescore:
-            return await conn.fetch("SELECT * FROM jobs")
+            return await conn.fetch("SELECT * FROM jobs LIMIT $1", limit)
         return await conn.fetch(
             """
             SELECT j.* FROM jobs j
             LEFT JOIN applications a ON a.job_id = j.id AND a.user_id = $1
             WHERE a.id IS NULL OR a.score IS NULL
+            LIMIT $2
             """,
             user_id,
+            limit,
         )
 
 
