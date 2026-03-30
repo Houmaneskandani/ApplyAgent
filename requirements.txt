@@ -11,3 +11,8 @@ python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
 supabase
+playwright-stealth
+pypdf
+capsolver
+twilio
+stripe

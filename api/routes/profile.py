@@ -44,20 +44,23 @@ async def get_profile(user=Depends(get_current_user)):
 
 
 @router.put("/")
-async def update_profile(data: dict, user=Depends(get_current_user)):
+async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
             UPDATE users SET name = $1, preferences = $2
             WHERE id = $3
         """, data.get("name"), json.dumps(data.get("preferences", {})), user["user_id"])
-        return {"status": "updated"}
+    # Rescore all jobs in background using the updated profile
+    background_tasks.add_task(score_jobs, user["user_id"], None, True)
+    return {"status": "updated", "rescoring": True}
 
 
 @router.post("/resume")
 async def upload_resume(
     file: UploadFile = File(...),
-    user=Depends(get_current_user)
+    background_tasks: BackgroundTasks = None,
+    user=Depends(get_current_user),
 ):
     if not file.filename or not file.filename.lower().endswith((".pdf", ".doc", ".docx")):
         raise HTTPException(status_code=400, detail="Only PDF, DOC, DOCX allowed")
@@ -86,7 +89,11 @@ async def upload_resume(
             user["user_id"],
         )
 
-    return {"resume_url": resume_url, "filename": file.filename}
+    # Rescore all jobs with the new resume
+    if background_tasks:
+        background_tasks.add_task(score_jobs, user["user_id"], None, True)
+
+    return {"resume_url": resume_url, "filename": file.filename, "rescoring": True}
 
 
 @router.post("/rescore")
