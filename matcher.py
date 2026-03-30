@@ -183,18 +183,27 @@ IMPORTANT: The skill LEVEL matters.
 
 Reply with ONLY a single integer (0-10). Nothing else."""
 
-    try:
-        message = client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=5,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        raw = message.content[0].text.strip()
-        match = re.search(r"\d+", raw)
-        return max(0, min(int(match.group()), 10)) if match else 5
-    except Exception as e:
-        print(f"    ✗ AI scoring error: {e}")
-        return 5
+    for attempt in range(4):
+        try:
+            message = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=5,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text.strip()
+            match = re.search(r"\d+", raw)
+            return max(0, min(int(match.group()), 10)) if match else 5
+        except Exception as e:
+            msg = str(e)
+            if "rate_limit" in msg or "529" in msg or "529" in msg:
+                wait = 60 * (attempt + 1)
+                print(f"    ⏳ Rate limited — waiting {wait}s (attempt {attempt+1}/4)...")
+                await asyncio.sleep(wait)
+            else:
+                print(f"    ✗ AI scoring error: {e}")
+                return 5
+    print(f"    ✗ Gave up scoring after 4 attempts (rate limit)")
+    return 5
 
 
 # ── Main scorer ────────────────────────────────────────────────────────────
@@ -236,6 +245,10 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     scored = 0
     skipped = 0
 
+    # Rate limit: ~20 jobs/min keeps us well under 50k tokens/min
+    # Each prompt is ~600-800 tokens input + 5 tokens output
+    DELAY_BETWEEN_CALLS = 3.0  # seconds
+
     for job in jobs:
         job_dict = dict(job)
         title = job_dict.get("title", "")
@@ -254,6 +267,8 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
             print(f"  [{score}/10] ✓ {title} @ {job_dict.get('company', '')}")
         elif score <= 3:
             print(f"  [{score}/10] ✗ {title} @ {job_dict.get('company', '')}")
+
+        await asyncio.sleep(DELAY_BETWEEN_CALLS)
 
     print(f"\n  Done — scored: {scored}  |  skipped (not engineering): {skipped}")
 
