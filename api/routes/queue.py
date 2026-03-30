@@ -121,6 +121,14 @@ async def get_queue(user=Depends(get_current_user)):
     return [dict(r) for r in rows]
 
 
+@router.post("/trigger-scrape")
+async def trigger_scrape(user=Depends(get_current_user)):
+    """Manually trigger a scrape + score cycle (runs in background)."""
+    from scheduler import run_scrape_and_score
+    asyncio.create_task(run_scrape_and_score())
+    return {"status": "scrape started — new jobs will appear within a few minutes"}
+
+
 @router.delete("/{job_id}")
 async def remove_from_queue(job_id: int, user=Depends(get_current_user)):
     """Cancel a queued job or dismiss a failed job (resets it to 'new' in Job Matches)."""
