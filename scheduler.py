@@ -79,7 +79,6 @@ async def run_scrape_and_score():
     from scrapers.ycombinator import scrape_ycombinator
     from scrapers.wellfound import scrape_wellfound
     from scrapers.jsearch import scrape_jsearch
-    from matcher import score_jobs
     from db import get_pool
 
     print("\n[Scraper] Starting scrape...")
@@ -99,26 +98,12 @@ async def run_scrape_and_score():
         except Exception as e:
             print(f"  [Scraper] {name} failed: {e}")
 
-    print("[Scraper] Scrape done. Scoring...")
-    try:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            users = await conn.fetch("SELECT id FROM users")
-        for user in users:
-            try:
-                await score_jobs(user["id"])
-            except Exception as e:
-                print(f"  [Scraper] Scoring error for user {user['id']}: {e}")
-    except Exception as e:
-        print(f"[Scraper] Scoring error: {e}")
-    print("[Scraper] Done.")
+    print("[Scraper] Scrape done. (Scoring runs on-demand via Search Jobs button.)")
 
 
 async def scheduler_loop():
-    """Background task — scrapes every 6h, auto-applies every 1h."""
+    """Background task — scrapes every 6h, auto-applies every 1h. No scoring on startup."""
     print("[Scheduler] Started")
-    # Run scrape immediately on startup
-    asyncio.create_task(run_scrape_and_score())
     scrape_counter = 0
     while True:
         await asyncio.sleep(3600)

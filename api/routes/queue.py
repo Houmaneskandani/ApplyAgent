@@ -123,10 +123,15 @@ async def get_queue(user=Depends(get_current_user)):
 
 @router.post("/trigger-scrape")
 async def trigger_scrape(user=Depends(get_current_user)):
-    """Manually trigger a scrape + score cycle (runs in background)."""
-    from scheduler import run_scrape_and_score
-    asyncio.create_task(run_scrape_and_score())
-    return {"status": "scrape started — new jobs will appear within a few minutes"}
+    """Manually trigger a scrape then score up to 100 new jobs for this user."""
+    async def _run(user_id: int):
+        from scheduler import run_scrape_and_score
+        from matcher import score_jobs
+        await run_scrape_and_score()
+        print(f"[TriggerScrape] Scoring up to 100 new jobs for user {user_id}...")
+        await score_jobs(user_id)
+    asyncio.create_task(_run(user["user_id"]))
+    return {"status": "scrape started — up to 100 new jobs will be scored for you"}
 
 
 @router.delete("/{job_id}")
