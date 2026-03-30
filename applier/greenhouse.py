@@ -91,13 +91,14 @@ CRITICAL RULES — you will be penalized for breaking these:
                 return ""
     return ""
 
-async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_uids: set = None, company: str = None) -> tuple[str, bytes] | tuple[None, None]:
+async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_uids: set = None, company: str = None, imap_user: str = None, imap_pass: str = None) -> tuple[str, bytes] | tuple[None, None]:
     """
     Poll Gmail via IMAP for a Greenhouse verification code.
     Returns (code, uid) so callers can add the uid to used_uids to avoid reuse.
     Skips any email whose UID is already in used_uids.
     Only accepts emails received at or after since_dt (2-minute buffer for clock skew).
     If company is provided, only accepts emails whose subject contains the company name.
+    Uses per-user imap_user/imap_pass if provided, falls back to global SMTP_USER/SMTP_PASS.
     """
     import imaplib
     import email as _email
@@ -106,8 +107,11 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
     from datetime import datetime, timezone, timedelta
     from config import SMTP_USER, SMTP_PASS
 
-    if not SMTP_USER or not SMTP_PASS:
-        print("    ✗ SMTP_USER/SMTP_PASS not set — cannot read verification email")
+    imap_user = imap_user or SMTP_USER
+    imap_pass = imap_pass or SMTP_PASS
+
+    if not imap_user or not imap_pass:
+        print("    ✗ No IMAP credentials — set Gmail + App Password in Profile → Email Verification")
         return None, None
 
     if since_dt is None:
@@ -115,7 +119,7 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
     if used_uids is None:
         used_uids = set()
 
-    print(f"    📧 Polling {SMTP_USER} for Greenhouse verification email (up to {wait_sec}s)...")
+    print(f"    📧 Polling {imap_user} for Greenhouse verification email (up to {wait_sec}s)...")
     elapsed = 0
     for tick in range(wait_sec // 5):
         await asyncio.sleep(5)
@@ -123,7 +127,7 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
         print(f"    ⏳ [{elapsed}s] Checking inbox...")
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(SMTP_USER, SMTP_PASS)
+            mail.login(imap_user, imap_pass)
             mail.select('"[Gmail]/All Mail"')
 
             since_str = since_dt.strftime("%d-%b-%Y")
@@ -515,7 +519,7 @@ async def handle_errors_and_retry(frame, page, max_retries: int = 5, profile_tex
         security = frame.locator("input[id^='security-input']")
         if await security.count() > 0:
             print("    → Email verification required — fetching code from Gmail...")
-            code, uid = await read_email_verification_code(wait_sec=90, since_dt=session_start, used_uids=used_uids, company=company)
+            code, uid = await read_email_verification_code(wait_sec=90, since_dt=session_start, used_uids=used_uids, company=company, imap_user=user_info.get("imap_user"), imap_pass=user_info.get("imap_pass"))
             if code:
                 used_uids.add(uid)
                 # Next attempt must find an email strictly newer than this one
@@ -597,7 +601,7 @@ async def handle_errors_and_retry(frame, page, max_retries: int = 5, profile_tex
         security = frame.locator("input[id^='security-input']")
         if await security.count() > 0:
             print("    → Email verification code appeared after submit — reading from Gmail...")
-            code, uid = await read_email_verification_code(wait_sec=90, since_dt=session_start, used_uids=used_uids, company=company)
+            code, uid = await read_email_verification_code(wait_sec=90, since_dt=session_start, used_uids=used_uids, company=company, imap_user=user_info.get("imap_user"), imap_pass=user_info.get("imap_pass"))
             if code:
                 used_uids.add(uid)
                 # Next attempt must find an email strictly newer than this one
