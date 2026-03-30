@@ -47,7 +47,7 @@ async def signup(req: SignupRequest):
         existing = await conn.fetchrow("SELECT id FROM users WHERE email = $1", req.email)
         if existing:
             raise HTTPException(status_code=400, detail="Email already registered")
-        hashed = pwd_context.hash(req.password)
+        hashed = pwd_context.hash(req.password[:72])
         row = await conn.fetchrow("""
             INSERT INTO users (email, name, password_hash)
             VALUES ($1, $2, $3) RETURNING id
@@ -64,7 +64,8 @@ async def login(req: LoginRequest):
         )
         if not user or not user["password_hash"]:
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        if not pwd_context.verify(req.password, user["password_hash"]):
+        password = req.password[:72]  # bcrypt max is 72 bytes
+        if not pwd_context.verify(password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         token = create_token(user["id"], req.email)
         return {"token": token, "user_id": user["id"], "name": user["name"]}
