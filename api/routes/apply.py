@@ -224,6 +224,8 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
             "github": prefs.get("github", ""),
             "website": prefs.get("portfolio", ""),
             "salary": f"{prefs.get('salary_min', '')}-{prefs.get('salary_max', '')}".strip("-") or "Open to discuss",
+            "imap_user": prefs.get("imap_user", ""),
+            "imap_pass": prefs.get("imap_pass", ""),
         }
 
         await _set_step(user_id, job_id, "Reading resume...")

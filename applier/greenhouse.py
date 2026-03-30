@@ -114,6 +114,8 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
         print("    ✗ No IMAP credentials — set Gmail + App Password in Profile → Email Verification")
         return None, None
 
+    print(f"    📧 Using IMAP account: {imap_user}")
+
     if since_dt is None:
         since_dt = datetime.now(timezone.utc) - timedelta(seconds=30)
     if used_uids is None:
