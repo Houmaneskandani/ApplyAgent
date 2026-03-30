@@ -1,0 +1,6 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+startCommand = "python worker.py"
+cronSchedule = "0 */6 * * *"

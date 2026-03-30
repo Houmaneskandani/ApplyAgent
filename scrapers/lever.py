@@ -1,5 +1,7 @@
 import httpx
+import html as html_module
 from db import insert_jobs_batch
+from matcher import is_engineering_job
 
 LEVER_COMPANIES = [
     "netflix", "uber", "reddit", "scale-ai", "openai",
@@ -27,12 +29,13 @@ async def scrape_lever():
                         "location": (job.get("categories") or {}).get("location", ""),
                         "url": job.get("hostedUrl"),
                         "source": "lever",
-                        "description": job.get("descriptionPlain", "")[:500]
+                        "description": html_module.unescape(job.get("description") or job.get("descriptionPlain", ""))[:5000]
                     }
                     for job in jobs
+                    if is_engineering_job(job.get("text", ""))
                 ]
                 all_jobs.extend(batch)
-                print(f"  {company}: {len(batch)} jobs")
+                print(f"  {company}: {len(batch)} engineering jobs")
             except Exception as e:
                 print(f"  Error scraping {company}: {e}")
 

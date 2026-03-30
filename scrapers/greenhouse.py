@@ -2,6 +2,7 @@ import httpx
 import asyncio
 import re
 from db import insert_jobs_batch
+from matcher import is_engineering_job
 
 GREENHOUSE_COMPANIES = [
     "airbnb", "stripe", "notion", "figma", "linear",
@@ -12,9 +13,12 @@ GREENHOUSE_COMPANIES = [
 
 
 def clean_html(html: str) -> str:
-    text = re.sub(r'<[^>]+>', ' ', html)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text[:2000]
+    import html as html_module
+    # Decode HTML entities first (handles double-encoded content like &lt;h2&gt; → <h2>)
+    html = html_module.unescape(html)
+    # Remove script/style tags and their content, keep all other HTML for rendering
+    html = re.sub(r'<(script|style)[^>]*>.*?</(script|style)>', '', html, flags=re.DOTALL)
+    return html[:5000]
 
 
 async def fetch_description(client, company, job_id):
@@ -58,8 +62,9 @@ async def scrape_greenhouse():
                         }
 
                 batch = await asyncio.gather(*[fetch_with_limit(j) for j in jobs])
-                all_jobs.extend(batch)
-                print(f"  {company}: {len(batch)} jobs with descriptions")
+                eng_batch = [j for j in batch if is_engineering_job(j.get("title", ""))]
+                all_jobs.extend(eng_batch)
+                print(f"  {company}: {len(eng_batch)}/{len(batch)} engineering jobs")
 
             except Exception as e:
                 print(f"  Error scraping {company}: {e}")

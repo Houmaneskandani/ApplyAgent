@@ -48,6 +48,16 @@ async def init_db():
         """)
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS resume_url TEXT")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMP")
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credits FLOAT DEFAULT 100")
+        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS queue_position INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS dry_run BOOLEAN DEFAULT TRUE")
+        # Reset any jobs that were mid-apply when server last restarted
+        await conn.execute("""
+            UPDATE applications SET status = 'failed', notes = 'Server restarted during apply'
+            WHERE status = 'applying'
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
                 id SERIAL PRIMARY KEY,
@@ -105,7 +115,10 @@ async def insert_jobs_batch(jobs: list[dict]):
             """
             INSERT INTO jobs (title, company, location, url, source, description)
             VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (url) DO NOTHING
+            ON CONFLICT (url) DO UPDATE
+              SET description = EXCLUDED.description
+              WHERE (jobs.description IS NULL OR jobs.description = '')
+                AND EXCLUDED.description != ''
             """,
             [
                 (
@@ -121,9 +134,11 @@ async def insert_jobs_batch(jobs: list[dict]):
         )
 
 
-async def get_unscored_jobs(user_id: int):
+async def get_unscored_jobs(user_id: int, rescore: bool = False):
     pool = await get_pool()
     async with pool.acquire() as conn:
+        if rescore:
+            return await conn.fetch("SELECT * FROM jobs")
         return await conn.fetch(
             """
             SELECT j.* FROM jobs j
@@ -152,16 +167,28 @@ async def upsert_application(user_id: int, job_id: int, score: int):
 async def update_application_status(user_id: int, job_id: int, status: str):
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO applications (user_id, job_id, status)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, job_id) DO UPDATE SET status = $3, applied_at = NOW()
-            """,
-            user_id,
-            job_id,
-            status,
-        )
+        if status == "applied":
+            await conn.execute(
+                """
+                INSERT INTO applications (user_id, job_id, status, applied_at)
+                VALUES ($1, $2, $3, NOW())
+                ON CONFLICT (user_id, job_id) DO UPDATE SET status = $3, applied_at = NOW()
+                """,
+                user_id,
+                job_id,
+                status,
+            )
+        else:
+            await conn.execute(
+                """
+                INSERT INTO applications (user_id, job_id, status)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, job_id) DO UPDATE SET status = $3
+                """,
+                user_id,
+                job_id,
+                status,
+            )
 
 
 async def get_top_jobs(user_id: int, min_score: int = 6, limit: int = 50):
@@ -218,3 +245,55 @@ async def get_user_id_by_email(email: str) -> int | None:
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT id FROM users WHERE email = $1", email)
         return row["id"] if row else None
+
+
+async def get_user_credits(user_id: int) -> float:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT credits FROM users WHERE id = $1", user_id)
+        return float(row["credits"] or 0) if row else 0.0
+
+
+async def deduct_credits(user_id: int, amount: float) -> bool:
+    """Deduct credits. Returns False if balance is insufficient."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT credits FROM users WHERE id = $1", user_id
+        )
+        if not row or (row["credits"] or 0) < amount:
+            return False
+        await conn.execute(
+            "UPDATE users SET credits = credits - $1 WHERE id = $2",
+            amount, user_id,
+        )
+        return True
+
+
+async def add_credits(user_id: int, amount: float):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET credits = COALESCE(credits, 0) + $1 WHERE id = $2",
+            amount, user_id,
+        )
+
+
+async def add_to_queue(user_id: int, job_id: int, dry_run: bool) -> int:
+    """Add job to the application queue. Returns queue position (1-indexed)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT COUNT(*) as cnt FROM applications
+            WHERE user_id = $1 AND status IN ('queued', 'applying')
+        """, user_id)
+        position = (row["cnt"] or 0) + 1
+
+        await conn.execute("""
+            INSERT INTO applications (user_id, job_id, status, queue_position, dry_run)
+            VALUES ($1, $2, 'queued', $3, $4)
+            ON CONFLICT (user_id, job_id) DO UPDATE
+            SET status = 'queued', queue_position = $3, dry_run = $4
+        """, user_id, job_id, position, dry_run)
+
+        return position
