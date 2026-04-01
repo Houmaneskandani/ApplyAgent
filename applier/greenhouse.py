@@ -943,10 +943,20 @@ async def fill_react_select(frame, field_id: str, value: str = None, label: str 
             print(f"    - No options found for {field_id}")
             return False
 
-        print(f"    ? AI choosing from: {option_texts}")
+        # If a batch answer was provided, try to match it directly before calling AI
+        ai_choice = ""
+        if value:
+            val_lower = value.strip().lower()
+            for text in option_texts:
+                if text.lower() == val_lower or val_lower in text.lower() or text.lower() in val_lower:
+                    ai_choice = text
+                    print(f"    ✓ Batch match: {text!r}")
+                    break
 
-        # Ask Claude to pick the best option
-        prompt = f"""
+        if not ai_choice:
+            print(f"    ? AI choosing from: {option_texts}")
+            # Ask Claude to pick the best option
+            prompt = f"""
 You are filling out a job application for this candidate:
 {profile_text or ""}
 
@@ -967,18 +977,18 @@ CRITICAL RULES:
 9. For school/university/institution dropdowns: find the closest matching school name in the list. If the exact school is not listed, pick "Other" or the closest partial match. NEVER explain — just pick one option.
 10. YOU MUST PICK ONE OPTION FROM THE LIST. If nothing matches, pick "Other" or the first option. NEVER return an explanation.
 """
-        try:
-            message = await client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=50,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            ai_choice = message.content[0].text.strip()
-            print(f"    → AI chose: {ai_choice}")
-        except Exception as e:
-            print(f"    ✗ AI error: {e}")
-            # Fall back to first non-empty option
-            ai_choice = option_texts[0] if option_texts else ""
+            try:
+                message = await client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=50,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                ai_choice = message.content[0].text.strip()
+                print(f"    → AI chose: {ai_choice}")
+            except Exception as e:
+                print(f"    ✗ AI error: {e}")
+                # Fall back to first non-empty option
+                ai_choice = option_texts[0] if option_texts else ""
 
         if not ai_choice:
             await el.press("Escape")
@@ -1221,11 +1231,23 @@ async def fill_custom_questions_with_ai(frame, profile_text: str = None):
 
         elif item["type"] == "checkbox_group":
             print(f"    ? Checkbox: {key} → {answer[:40]}")
+            # Batch may return "US", "Remote", or list-like "['US', 'Remote']"
+            import re as _re_cb
+            raw_ans = answer.strip()
+            # Extract individual values from list-like strings: ['US', 'Remote'] → ['US', 'Remote']
+            list_matches = _re_cb.findall(r"'([^']+)'|\"([^\"]+)\"", raw_ans)
+            if list_matches:
+                check_vals = [a or b for a, b in list_matches]
+            else:
+                check_vals = [v.strip() for v in raw_ans.split(",") if v.strip()]
             for cb, text in item["opts"]:
-                a, t = answer.strip().lower(), text.strip().lower()
-                if (a == t) or (len(a) > 3 and a in t) or (len(t) > 3 and t in a):
-                    await cb.check()
-                    print(f"    ✓ Checked: {text}")
+                t = text.strip().lower()
+                for cv in check_vals:
+                    a = cv.strip().lower()
+                    if (a == t) or (len(a) > 2 and a in t) or (len(t) > 2 and t in a):
+                        await cb.check()
+                        print(f"    ✓ Checked: {text}")
+                        break
 
         elif item["type"] == "radio_group":
             print(f"    ? Radio: {key} → {answer[:40]}")
