@@ -84,7 +84,8 @@ async def get_jobs(min_score: int = 1, limit: int = 100, user=Depends(get_curren
                     job.get("title", ""), job.get("description", "")
                 )
                 job["posted_at"] = time_ago(job.get("created_at"))
-                job.pop("created_at", None)
+                raw_dt = job.get("created_at")
+                job["created_at"] = raw_dt.isoformat() if raw_dt else None
                 job.pop("description", None)
                 result.append(job)
 
