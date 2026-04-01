@@ -6,7 +6,7 @@ import anthropic
 from db import get_unscored_jobs, upsert_application, get_user_prefs, get_pool
 from config import ANTHROPIC_API_KEY
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── Title filters ──────────────────────────────────────────────────────────
 
@@ -185,7 +185,7 @@ Reply with ONLY a single integer (0-10). Nothing else."""
 
     for attempt in range(4):
         try:
-            message = client.messages.create(
+            message = await client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=5,
                 messages=[{"role": "user", "content": prompt}],
