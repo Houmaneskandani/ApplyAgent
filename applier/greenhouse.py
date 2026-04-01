@@ -91,6 +91,72 @@ CRITICAL RULES — you will be penalized for breaking these:
                 return ""
     return ""
 
+async def batch_get_answers(questions: list[dict], profile_text: str) -> dict:
+    """
+    Single API call to answer all form questions at once.
+    questions: [{"key": str, "label": str, "type": str, "options": list|None}]
+    Returns: {key: answer_str}
+    """
+    import json as _json
+    if not questions:
+        return {}
+
+    q_lines = []
+    for i, q in enumerate(questions):
+        opts = f" Options: {q['options']}" if q.get("options") else ""
+        q_lines.append(f'{i+1}. [{q["type"]}] {q["label"]}{opts}')
+
+    prompt = f"""You are filling out a job application for this candidate:
+
+{profile_text}
+
+Answer ALL of the following form questions. Reply with a single JSON object where keys are the question numbers (as strings) and values are the answers.
+
+QUESTIONS:
+{chr(10).join(q_lines)}
+
+RULES:
+- Yes/No fields: answer "Yes" or "No" only
+- Short text fields: under 15 words
+- Textarea fields: 3-5 sentences, professional and genuine
+- Dropdown/radio/checkbox: reply with the exact best option text
+- Sponsorship/visa questions: if work_auth is citizen or authorized → "No"
+- Acknowledgment/consent/compliance questions → always "Yes"
+- "How did you hear about us" → "Online job search"
+- Demographic (gender/race/disability/veteran): use exact profile values, pick "decline" if profile says decline
+- School not in dropdown list → pick "Other"
+- If unsure → give best short professional answer
+
+Reply ONLY with valid JSON. No explanation. No markdown. Example:
+{{"1": "Yes", "2": "5 years", "3": "I am authorized to work in the US"}}"""
+
+    for attempt in range(3):
+        try:
+            if attempt > 0:
+                await asyncio.sleep(2 ** attempt)
+            message = client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1500,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            data = _json.loads(raw)
+            return {questions[int(k)-1]["key"]: str(v) for k, v in data.items() if k.isdigit() and int(k)-1 < len(questions)}
+        except Exception as e:
+            err = str(e)
+            if "rate_limit" in err or "429" in err:
+                print(f"    ⚠ Rate limit on batch — waiting {2**(attempt+1)}s...")
+                await asyncio.sleep(2 ** (attempt + 1))
+            else:
+                print(f"    ⚠ Batch answer failed (attempt {attempt+1}): {e}")
+    return {}
+
+
 async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_uids: set = None, company: str = None, imap_user: str = None, imap_pass: str = None) -> tuple[str, bytes] | tuple[None, None]:
     """
     Poll Gmail via IMAP for a Greenhouse verification code.
@@ -980,204 +1046,197 @@ COUNTRY_NAMES = {
 
 
 async def fill_custom_questions_with_ai(frame, profile_text: str = None):
+    """
+    Collect ALL form questions, answer them in ONE batch API call, then fill all fields.
+    ~85% cheaper than calling get_answer() per field.
+    """
+    import re as _re
     profile = profile_text or ""
 
-    # 1. Handle ALL React Select comboboxes
+    # ── Phase 1: Collect all questions ──────────────────────────────────────
+
+    # Items to fill after batch: list of dicts with enough info to fill the field
+    fill_items = []   # {"type": ..., "el": ..., "key": str, "label": str, ...}
+    questions  = []   # [{key, label, type, options}] — fed to batch_get_answers
+
+    def add_q(key, label, qtype, options=None):
+        questions.append({"key": key, "label": label, "type": qtype, "options": options})
+
+    # 1. React Select comboboxes
     comboboxes = await frame.locator("input[role='combobox']").all()
     for el in comboboxes:
         field_id = await el.get_attribute("id")
-        if not field_id:
-            continue
-        if field_id in ("country", "candidate-location"):
+        if not field_id or field_id in ("country", "candidate-location"):
             continue
         if not await el.is_visible():
             continue
 
-        # Find label
-        if field_id.isdigit():
-            label_el = frame.locator(f"label[for='{field_id}']")
-        else:
-            label_el = frame.locator(f"label[for='{field_id}'], [id='{field_id}-label']")
-
-        label_text = ""
-        if await label_el.count() > 0:
-            label_text = await label_el.first.inner_text()
-
+        label_el = frame.locator(f"label[for='{field_id}'], [id='{field_id}-label']")
+        label_text = (await label_el.first.inner_text()) if await label_el.count() > 0 else ""
         if not label_text or label_text.strip().lower() in COUNTRY_NAMES:
             continue
 
-        # Country-of-residence questions — extract from profile directly, don't ask AI
-        # (AI picks wrong country when shown 200-option dropdown before typing)
         label_lower = label_text.strip().lower()
         if any(kw in label_lower for kw in ["country", "nation", "reside", "citizenship", "where do you currently live"]):
-            import re as _re
             m = _re.search(r"Country:\s*(.+)", profile)
             country_direct = (m.group(1).strip() if m else None) or "United States"
             print(f"    ? Country-of-residence: using '{country_direct}' from profile")
             await fill_react_select(frame, field_id, country_direct, label_text, profile)
             continue
 
-        print(f"    ? Combobox: {label_text[:60]}")
-        answer = await get_answer(label_text, "dropdown", profile_text=profile)
-        if answer:
-            await fill_react_select(frame, field_id, answer, label_text, profile)
-        else:
-            await fill_react_select(frame, field_id, "", label_text, profile)
+        key = f"cb_{field_id}"
+        add_q(key, label_text, "dropdown")
+        fill_items.append({"type": "combobox", "el": el, "field_id": field_id, "label": label_text, "key": key})
 
-    # 2. Handle native SELECT dropdowns
+    # 2. Native SELECT dropdowns (question_*)
     selects = await frame.locator("select[id^='question_']").all()
     for el in selects:
         field_id = await el.get_attribute("id")
         if not field_id:
             continue
         label_el = frame.locator(f"label[for='{field_id}']")
-        label_text = ""
-        if await label_el.count() > 0:
-            label_text = await label_el.first.inner_text()
+        label_text = (await label_el.first.inner_text()) if await label_el.count() > 0 else ""
         if not label_text:
             continue
+        key = f"sel_{field_id}"
+        add_q(key, label_text, "dropdown")
+        fill_items.append({"type": "select", "el": el, "key": key, "label": label_text})
 
-        print(f"    ? Select: {label_text[:60]}")
-        answer = await get_answer(label_text, "dropdown", profile_text=profile_text)
-        if answer:
-            try:
-                await el.select_option(label=answer)
-                print(f"    ✓ Selected: {answer}")
-            except Exception:
-                try:
-                    options = await el.locator("option").all()
-                    for opt in options:
-                        opt_text = await opt.inner_text()
-                        if answer.lower() in opt_text.lower():
-                            val = await opt.get_attribute("value")
-                            await el.select_option(value=val)
-                            print(f"    ✓ Selected: {opt_text}")
-                            break
-                except Exception as e:
-                    print(f"    ✗ Select failed: {e}")
-
-    # 2b. Handle Greenhouse EEOC/demographic selects (id^='job_application_')
+    # 2b. EEOC/demographic selects (job_application_*)
     eeoc_selects = await frame.locator("select[id^='job_application_']").all()
     for el in eeoc_selects:
         field_id = await el.get_attribute("id")
         if not field_id:
             continue
         label_el = frame.locator(f"label[for='{field_id}']")
-        label_text = ""
-        if await label_el.count() > 0:
-            label_text = await label_el.first.inner_text()
-        if not label_text:
-            label_text = field_id.replace("job_application_", "").replace("_", " ").title()
-        options = await el.locator("option").all()
-        option_texts = []
-        for opt in options:
-            val = await opt.get_attribute("value")
-            if val:
-                option_texts.append(await opt.inner_text())
-        print(f"    ? EEOC: {label_text[:60]}")
-        answer = await get_answer(f"{label_text}. Options: {option_texts}", "dropdown", profile_text=profile_text)
-        if answer:
-            try:
-                await el.select_option(label=answer)
-                print(f"    ✓ EEOC Selected: {answer}")
-            except Exception:
-                for opt in options:
-                    text = await opt.inner_text()
-                    if answer.lower() in text.lower():
-                        val = await opt.get_attribute("value")
-                        await el.select_option(value=val)
-                        print(f"    ✓ EEOC Selected (fuzzy): {text}")
-                        break
+        label_text = (await label_el.first.inner_text()) if await label_el.count() > 0 else \
+            field_id.replace("job_application_", "").replace("_", " ").title()
+        opts = [await o.inner_text() for o in await el.locator("option").all() if await o.get_attribute("value")]
+        key = f"eeoc_{field_id}"
+        add_q(key, label_text, "dropdown", opts)
+        fill_items.append({"type": "eeoc_select", "el": el, "key": key, "label": label_text, "options_els": await el.locator("option").all()})
 
-    # 3. Handle CHECKBOX groups
+    # 3. Checkbox groups
     checkboxes = await frame.locator("input[type='checkbox'][id^='question_']").all()
     checkbox_groups = {}
     for cb in checkboxes:
         name = await cb.get_attribute("name")
-        if not name:
-            continue
-        if name not in checkbox_groups:
-            checkbox_groups[name] = []
-        checkbox_groups[name].append(cb)
+        if name:
+            checkbox_groups.setdefault(name, []).append(cb)
 
     for group_name, boxes in checkbox_groups.items():
-        option_texts = []
+        opts = []
         for cb in boxes:
             cb_id = await cb.get_attribute("id")
-            cb_label = frame.locator(f"label[for='{cb_id}']")
-            if await cb_label.count() > 0:
-                option_texts.append((cb, await cb_label.first.inner_text()))
+            lbl = frame.locator(f"label[for='{cb_id}']")
+            if await lbl.count() > 0:
+                opts.append((cb, await lbl.first.inner_text()))
+        key = f"chk_{group_name}"
+        add_q(key, group_name, "checkbox", [t for _, t in opts])
+        fill_items.append({"type": "checkbox_group", "key": key, "opts": opts})
 
-        first_cb_id = await boxes[0].get_attribute("id")
-        group_label = frame.locator(f"label[for='{group_name}'], [id='{group_name}-label']")
-        label_text = group_name
-
-        print(f"    ? Checkbox group: {group_name[:40]} options={[t for _, t in option_texts]}")
-        answer = await get_answer(f"{group_name} pick from: {[t for _, t in option_texts]}", "checkbox", profile_text=profile_text)
-
-        for cb, text in option_texts:
-            a = answer.strip().lower()
-            t = text.strip().lower()
-            # Exact match, OR substring only if both sides are longer than 3 chars
-            # (prevents "us" matching "australia", "uk" matching "turkey", etc.)
-            match = (a == t) or (len(a) > 3 and a in t) or (len(t) > 3 and t in a)
-            if match:
-                await cb.check()
-                print(f"    ✓ Checked: {text}")
-
-    # 4. Handle RADIO groups
+    # 4. Radio groups
     radios = await frame.locator("input[type='radio'][id^='question_']").all()
     radio_groups = {}
-    for radio in radios:
-        name = await radio.get_attribute("name")
-        if not name:
-            continue
-        if name not in radio_groups:
-            radio_groups[name] = []
-        radio_groups[name].append(radio)
+    for r in radios:
+        name = await r.get_attribute("name")
+        if name:
+            radio_groups.setdefault(name, []).append(r)
 
-    for group_name, options in radio_groups.items():
-        option_texts = []
-        for opt in options:
+    for group_name, opts in radio_groups.items():
+        opt_texts = []
+        for opt in opts:
             opt_id = await opt.get_attribute("id")
-            opt_label = frame.locator(f"label[for='{opt_id}']")
-            if await opt_label.count() > 0:
-                option_texts.append(await opt_label.first.inner_text())
+            lbl = frame.locator(f"label[for='{opt_id}']")
+            if await lbl.count() > 0:
+                opt_texts.append(await lbl.first.inner_text())
+        key = f"radio_{group_name}"
+        add_q(key, group_name, "radio", opt_texts)
+        fill_items.append({"type": "radio_group", "key": key, "opts": opts, "opt_texts": opt_texts})
 
-        print(f"    ? Radio: {group_name[:40]} → {option_texts}")
-        answer = await get_answer(f"{group_name} choose from: {option_texts}", "radio", profile_text=profile_text)
-        if answer:
-            for i, opt in enumerate(options):
-                if i < len(option_texts) and answer.lower() in option_texts[i].lower():
-                    await opt.click()
-                    print(f"    ✓ Radio: {option_texts[i]}")
-                    break
-
-    # 5. Handle TEXT inputs and TEXTAREAS
-    inputs = await frame.locator(
-        "input[id^='question_']:not([type='radio']):not([type='checkbox']):not([type='hidden']):not([type='file']):not([role='combobox'])"
-    ).all()
+    # 5. Text inputs and textareas
+    inputs   = await frame.locator("input[id^='question_']:not([type='radio']):not([type='checkbox']):not([type='hidden']):not([type='file']):not([role='combobox'])").all()
     textareas = await frame.locator("textarea[id^='question_']").all()
-
     for el in inputs + textareas:
         field_id = await el.get_attribute("id")
         if not field_id or field_id == "country":
             continue
-
         label_el = frame.locator(f"label[for='{field_id}']")
-        label_text = ""
-        if await label_el.count() > 0:
-            label_text = await label_el.first.inner_text()
+        label_text = (await label_el.first.inner_text()) if await label_el.count() > 0 else ""
         if not label_text or label_text.strip().lower() in COUNTRY_NAMES:
             continue
-
         tag = await el.evaluate("el => el.tagName.toLowerCase()")
-        field_type = "textarea" if tag == "textarea" else "text"
+        ftype = "textarea" if tag == "textarea" else "text"
+        key = f"txt_{field_id}"
+        add_q(key, label_text, ftype)
+        fill_items.append({"type": "text", "el": el, "key": key, "label": label_text})
 
-        print(f"    ? Text: {label_text[:60]}")
-        answer = await get_answer(label_text, field_type, profile_text=profile_text)
-        if answer:
-            await el.fill(answer)
-            print(f"    ✓ {answer[:50]}")
-        else:
-            print(f"    - Skipped: no match for '{label_text[:40]}'")
+    if not questions:
+        return
+
+    # ── Phase 2: ONE batch API call ─────────────────────────────────────────
+    print(f"    ⚡ Batch answering {len(questions)} questions in 1 API call...")
+    answers = await batch_get_answers(questions, profile)
+    print(f"    ✓ Got {len(answers)} answers")
+
+    # ── Phase 3: Fill all fields using answers ───────────────────────────────
+    for item in fill_items:
+        key = item["key"]
+        answer = answers.get(key, "")
+
+        if item["type"] == "combobox":
+            print(f"    ? Combobox: {item['label'][:60]} → {answer[:40]}")
+            await fill_react_select(frame, item["field_id"], answer, item["label"], profile)
+
+        elif item["type"] == "select":
+            print(f"    ? Select: {item['label'][:60]} → {answer[:40]}")
+            if answer:
+                try:
+                    await item["el"].select_option(label=answer)
+                    print(f"    ✓ Selected: {answer}")
+                except Exception:
+                    try:
+                        for opt in await item["el"].locator("option").all():
+                            text = await opt.inner_text()
+                            if answer.lower() in text.lower():
+                                await item["el"].select_option(value=await opt.get_attribute("value"))
+                                print(f"    ✓ Selected (fuzzy): {text}")
+                                break
+                    except Exception as e:
+                        print(f"    ✗ Select failed: {e}")
+
+        elif item["type"] == "eeoc_select":
+            print(f"    ? EEOC: {item['label'][:60]} → {answer[:40]}")
+            if answer:
+                try:
+                    await item["el"].select_option(label=answer)
+                    print(f"    ✓ EEOC Selected: {answer}")
+                except Exception:
+                    for opt in item["options_els"]:
+                        text = await opt.inner_text()
+                        if answer.lower() in text.lower():
+                            await item["el"].select_option(value=await opt.get_attribute("value"))
+                            print(f"    ✓ EEOC Selected (fuzzy): {text}")
+                            break
+
+        elif item["type"] == "checkbox_group":
+            print(f"    ? Checkbox: {key} → {answer[:40]}")
+            for cb, text in item["opts"]:
+                a, t = answer.strip().lower(), text.strip().lower()
+                if (a == t) or (len(a) > 3 and a in t) or (len(t) > 3 and t in a):
+                    await cb.check()
+                    print(f"    ✓ Checked: {text}")
+
+        elif item["type"] == "radio_group":
+            print(f"    ? Radio: {key} → {answer[:40]}")
+            for i, opt in enumerate(item["opts"]):
+                if i < len(item["opt_texts"]) and answer.lower() in item["opt_texts"][i].lower():
+                    await opt.click()
+                    print(f"    ✓ Radio: {item['opt_texts'][i]}")
+                    break
+
+        elif item["type"] == "text":
+            print(f"    ? Text: {item['label'][:60]} → {answer[:50]}")
+            if answer:
+                await item["el"].fill(answer)
+                print(f"    ✓ Filled")
