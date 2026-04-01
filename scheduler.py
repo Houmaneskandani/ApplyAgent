@@ -81,24 +81,29 @@ async def run_scrape_and_score():
     from scrapers.jsearch import scrape_jsearch
     from db import get_pool
 
-    print("\n[Scraper] Starting scrape...")
-    for name, fn in [
-        ("Greenhouse", scrape_greenhouse),
-        ("Lever", scrape_lever),
-        ("Himalayas", scrape_himalayas),
-        ("Remotive", scrape_remotive),
-        ("Dice", scrape_dice),
+    scrapers = [
+        ("Greenhouse",  scrape_greenhouse),
+        ("Lever",       scrape_lever),
+        ("Himalayas",   scrape_himalayas),
+        ("Remotive",    scrape_remotive),
+        ("Dice",        scrape_dice),
         ("YCombinator", scrape_ycombinator),
-        ("Wellfound", scrape_wellfound),
-        ("JSearch", scrape_jsearch),
-    ]:
+        ("Wellfound",   scrape_wellfound),
+        ("JSearch",     scrape_jsearch),
+    ]
+
+    async def run_one(name, fn):
         try:
             count = await fn()
             print(f"  [Scraper] {name}: {count} jobs")
+            return count
         except Exception as e:
             print(f"  [Scraper] {name} failed: {e}")
+            return 0
 
-    print("[Scraper] Scrape done. (Scoring runs on-demand via Search Jobs button.)")
+    print("\n[Scraper] Starting scrape (all sources in parallel)...")
+    results = await asyncio.gather(*[run_one(n, f) for n, f in scrapers])
+    print(f"[Scraper] Done — {sum(results)} total jobs scraped. (Scoring runs on-demand.)")
 
 
 async def scheduler_loop():
