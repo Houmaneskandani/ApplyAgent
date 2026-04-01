@@ -5,7 +5,7 @@ from playwright.async_api import async_playwright
 from config import ANTHROPIC_API_KEY
 from applier.browser_utils import new_stealth_page, wait_for_captcha_if_present
 
-client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 async def get_answer(question: str, field_type: str, profile_text: str = None) -> str:
     if not profile_text:
@@ -75,7 +75,7 @@ CRITICAL RULES — you will be penalized for breaking these:
         try:
             if attempt > 0:
                 await asyncio.sleep(2 ** attempt)  # 2s, 4s backoff
-            message = client.messages.create(
+            message = await client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],
@@ -134,7 +134,7 @@ Reply ONLY with valid JSON. No explanation. No markdown. Example:
         try:
             if attempt > 0:
                 await asyncio.sleep(2 ** attempt)
-            message = client.messages.create(
+            message = await client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=1500,
                 messages=[{"role": "user", "content": prompt}],
@@ -546,7 +546,7 @@ async def _diagnose_screenshot(screenshot_path: str, error_context: str) -> str:
         import base64
         with open(screenshot_path, "rb") as f:
             img_b64 = base64.standard_b64encode(f.read()).decode()
-        msg = client.messages.create(
+        msg = await client.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=300,
             messages=[{
@@ -968,7 +968,7 @@ CRITICAL RULES:
 10. YOU MUST PICK ONE OPTION FROM THE LIST. If nothing matches, pick "Other" or the first option. NEVER return an explanation.
 """
         try:
-            message = client.messages.create(
+            message = await client.messages.create(
                 model="claude-haiku-4-5-20251001",
                 max_tokens=50,
                 messages=[{"role": "user", "content": prompt}]
