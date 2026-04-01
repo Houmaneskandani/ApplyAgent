@@ -52,19 +52,18 @@ async def fetch_description(client, company, job_id):
 
 async def scrape_greenhouse():
     all_jobs = []
+    semaphore = asyncio.Semaphore(10)  # max 10 concurrent description fetches globally
+
     async with httpx.AsyncClient(timeout=15) as client:
-        for company in GREENHOUSE_COMPANIES:
+
+        async def scrape_company(company):
             try:
                 r = await client.get(
                     f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
                 )
                 if r.status_code != 200:
-                    continue
-
+                    return []
                 jobs = r.json().get("jobs", [])
-
-                # Fetch all descriptions concurrently (max 10 at a time)
-                semaphore = asyncio.Semaphore(10)
 
                 async def fetch_with_limit(job):
                     async with semaphore:
@@ -80,12 +79,17 @@ async def scrape_greenhouse():
                         }
 
                 batch = await asyncio.gather(*[fetch_with_limit(j) for j in jobs])
-                eng_batch = [j for j in batch if is_engineering_job(j.get("title", ""))]
-                all_jobs.extend(eng_batch)
-                print(f"  {company}: {len(eng_batch)}/{len(batch)} engineering jobs")
-
+                eng = [j for j in batch if is_engineering_job(j.get("title", ""))]
+                print(f"  {company}: {len(eng)}/{len(jobs)} engineering jobs")
+                return eng
             except Exception as e:
                 print(f"  Error scraping {company}: {e}")
+                return []
+
+        # Scrape all companies in parallel
+        results = await asyncio.gather(*[scrape_company(c) for c in GREENHOUSE_COMPANIES])
+        for eng_batch in results:
+            all_jobs.extend(eng_batch)
 
     await insert_jobs_batch(all_jobs)
     return len(all_jobs)
