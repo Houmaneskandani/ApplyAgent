@@ -96,6 +96,38 @@ async def upload_resume(
     return {"resume_url": resume_url, "filename": file.filename, "rescoring": True}
 
 
+@router.post("/test-imap")
+async def test_imap(user=Depends(get_current_user)):
+    """Test whether the user's saved IMAP credentials work."""
+    import imaplib
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["user_id"])
+    import json
+    prefs = row["preferences"] if row else {}
+    if isinstance(prefs, str):
+        try:
+            prefs = json.loads(prefs)
+        except Exception:
+            prefs = {}
+    imap_user = (prefs or {}).get("imap_user", "")
+    imap_pass = (prefs or {}).get("imap_pass", "")
+    if not imap_user or not imap_pass:
+        raise HTTPException(status_code=400, detail="No IMAP credentials saved — fill in Gmail and App Password first")
+    try:
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(imap_user, imap_pass)
+        mail.logout()
+        return {"ok": True, "message": f"✓ Connected to {imap_user} successfully"}
+    except imaplib.IMAP4.error as e:
+        err = str(e)
+        if "AUTHENTICATIONFAILED" in err or "Invalid credentials" in err:
+            raise HTTPException(status_code=400, detail="Wrong password — make sure you're using a Gmail App Password, not your regular Gmail password. Go to myaccount.google.com/apppasswords to generate one.")
+        raise HTTPException(status_code=400, detail=f"IMAP error: {err}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Connection failed: {e}")
+
+
 @router.post("/rescore")
 async def rescore_jobs(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     """Rescore all jobs based on updated profile preferences."""

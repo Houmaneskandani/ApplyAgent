@@ -217,6 +217,11 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
                         return code, num
             mail.logout()
         except Exception as e:
+            err = str(e)
+            if "AUTHENTICATIONFAILED" in err or "Invalid credentials" in err:
+                print(f"    ✗ IMAP auth failed — wrong App Password for {imap_user}")
+                print(f"    ✗ Fix: Profile → Email Verification → generate a Gmail App Password (not your regular password)")
+                return None, None  # fail immediately, don't waste 90s retrying
             print(f"    ⚠ IMAP error: {e}")
     print(f"    ✗ No verification code found after {wait_sec}s")
     return None, None
