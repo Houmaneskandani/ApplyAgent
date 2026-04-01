@@ -5,10 +5,28 @@ from db import insert_jobs_batch
 from matcher import is_engineering_job
 
 GREENHOUSE_COMPANIES = [
-    "airbnb", "stripe", "notion", "figma", "linear",
+    # Original
+    "airbnb", "stripe", "figma", "linear",
     "shopify", "dropbox", "square", "robinhood", "brex",
-    "gusto", "rippling", "lattice", "airtable", "asana",
-    "benchling", "chime", "doordash", "instacart", "lyft"
+    "gusto", "lattice", "airtable", "asana",
+    "chime", "instacart", "lyft",
+    # AI / ML
+    "anthropic", "scaleai",
+    # Crypto / Fintech
+    "coinbase", "ripple", "gemini", "carta", "mercury",
+    # Infrastructure / DevOps
+    "cloudflare", "datadog", "mongodb", "elastic",
+    "twilio", "fivetran", "fastly", "newrelic", "pagerduty", "sumologic",
+    "gitlab", "vercel", "netlify", "planetscale",
+    # Consumer / Social
+    "reddit", "discord", "duolingo", "roblox", "pinterest",
+    "squarespace", "webflow", "toast",
+    # Enterprise / SaaS
+    "okta", "intercom", "faire",
+    # Autonomous / Robotics
+    "waymo", "nuro", "spacex",
+    # Other
+    "jetbrains", "databricks", "gusto", "ginkgobioworks",
 ]
 
 
