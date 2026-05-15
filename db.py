@@ -297,20 +297,27 @@ async def add_credits(user_id: int, amount: float):
 
 
 async def add_to_queue(user_id: int, job_id: int, dry_run: bool) -> int:
-    """Add job to the application queue. Returns queue position (1-indexed)."""
+    """
+    Add job to the application queue. Returns queue position (1-indexed).
+
+    Computes the position inside a transaction so two concurrent POST
+    /apply requests can't both observe the same COUNT and both insert
+    with the same queue_position.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("""
-            SELECT COUNT(*) as cnt FROM applications
-            WHERE user_id = $1 AND status IN ('queued', 'applying')
-        """, user_id)
-        position = (row["cnt"] or 0) + 1
+        async with conn.transaction():
+            row = await conn.fetchrow("""
+                SELECT COUNT(*) as cnt FROM applications
+                WHERE user_id = $1 AND status IN ('queued', 'applying')
+            """, user_id)
+            position = (row["cnt"] or 0) + 1
 
-        await conn.execute("""
-            INSERT INTO applications (user_id, job_id, status, queue_position, dry_run)
-            VALUES ($1, $2, 'queued', $3, $4)
-            ON CONFLICT (user_id, job_id) DO UPDATE
-            SET status = 'queued', queue_position = $3, dry_run = $4
-        """, user_id, job_id, position, dry_run)
+            await conn.execute("""
+                INSERT INTO applications (user_id, job_id, status, queue_position, dry_run)
+                VALUES ($1, $2, 'queued', $3, $4)
+                ON CONFLICT (user_id, job_id) DO UPDATE
+                SET status = 'queued', queue_position = $3, dry_run = $4
+            """, user_id, job_id, position, dry_run)
 
-        return position
+            return position
