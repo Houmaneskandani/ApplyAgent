@@ -10,10 +10,9 @@ from urllib.parse import urlparse
 # ─── Anti-detection: launch flags ────────────────────────────────────
 #
 # Why these flags:
-#  - --headless=new   : modern headless mode that ships with real Chrome.
-#                       Eliminates the WebGL "Google SwiftShader" renderer
-#                       and most of the "I'm running a HeadlessChrome build"
-#                       fingerprint that gave us away.
+#  - Playwright's bundled Chromium uses modern headless mode by default
+#    (since 1.40+). That alone eliminates the WebGL "Google SwiftShader"
+#    renderer and most of the "I'm a HeadlessChrome build" fingerprint.
 #  - --disable-blink-features=AutomationControlled : drops the headless-
 #    chrome banner and the "Automation: true" hint that's set even when
 #    navigator.webdriver is patched.
@@ -30,19 +29,20 @@ _BASE_LAUNCH_ARGS = [
 ]
 
 
-def _headless_mode() -> str | bool:
+def _headless_mode() -> bool:
     """
     Return the value to pass to `chromium.launch(headless=...)`.
 
-    Playwright accepts either a bool or the string "new" (which selects the
-    modern Chrome headless implementation). Default is "new". Setting
-    HEADED_BROWSER=1 disables headless (requires a display server in
-    Docker — see Dockerfile for Xvfb instructions).
+    Playwright's `headless` parameter is strictly bool. Modern headless
+    mode (the one that doesn't leak WebGL=SwiftShader, plugins.length=0,
+    etc.) is built into Playwright's bundled Chromium since 1.40+ — so
+    `headless=True` already gives us the good headless. No `--headless=new`
+    flag needed.
+
+    Setting HEADED_BROWSER=1 disables headless (requires a display server
+    in Docker — see Dockerfile for Xvfb instructions).
     """
-    if os.getenv("HEADED_BROWSER") == "1":
-        return False
-    # Playwright passes the string through to --headless=new under the hood.
-    return "new"
+    return os.getenv("HEADED_BROWSER") != "1"
 
 
 # ─── Per-session fingerprint randomization ────────────────────────────
@@ -259,7 +259,7 @@ async def stealth_session(
     The new high-level browser entry point. Yields (browser, context, page)
     with all anti-detection measures applied:
 
-      - Modern --headless=new (or headed if HEADED_BROWSER=1)
+      - Modern Playwright headless (or headed if HEADED_BROWSER=1)
       - Per-session randomized UA / viewport / locale / timezone
       - Optional proxy from PROXY_URL / PROXY_URLS env
       - Persistent storage_state per (user_id, ATS-domain)
