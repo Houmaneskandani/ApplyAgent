@@ -6,93 +6,99 @@ from applier.browser_utils import throttle_for_url
 
 router = APIRouter()
 
-# NOTE: this lock map is PROCESS-LOCAL. With a single uvicorn worker (Railway
-# default) it serializes a user's queue correctly. If you scale to multiple
-# workers, two processes can both grab the same 'queued' row and run it twice.
-# The recommended hardening is a DB-level claim using SELECT ... FOR UPDATE
-# SKIP LOCKED — that's a separate change tracked as a P1 follow-up.
-_user_locks: dict[int, asyncio.Lock] = {}
-
 # Max seconds a single application can run before being force-killed
 APPLICATION_TIMEOUT = 300  # 5 minutes
 
 
-def _get_lock(user_id: int) -> asyncio.Lock:
-    if user_id not in _user_locks:
-        _user_locks[user_id] = asyncio.Lock()
-    return _user_locks[user_id]
-
-
 async def process_user_queue(user_id: int):
-    """Process all queued jobs for a user one at a time. Safe to call concurrently."""
-    lock = _get_lock(user_id)
-    if lock.locked():
-        return  # Another processor is already running for this user
+    """
+    Process all queued jobs for a user one at a time.
 
-    async with lock:
-        while True:
+    SAFE for multi-worker deployments: the row claim is a single atomic
+    UPDATE against the DB using `SELECT ... FOR UPDATE SKIP LOCKED`, so
+    if two FastAPI workers both run this function for the same user, they
+    can't both grab the same row. Each gets a different queued row, or
+    one gets nothing and exits.
+
+    Previously this used a process-local asyncio.Lock dict (`_user_locks`),
+    which only worked with a single worker. Scaling to N workers would
+    have caused double-billing of the same application.
+    """
+    while True:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            # Atomic claim: SELECT a single queued row with FOR UPDATE
+            # SKIP LOCKED inside an UPDATE, returning the claimed columns
+            # in one round trip. Concurrent callers see different rows.
+            row = await conn.fetchrow("""
+                UPDATE applications
+                   SET status = 'applying',
+                       notes = 'Starting...',
+                       applied_at = NOW()
+                 WHERE id = (
+                     SELECT id FROM applications
+                      WHERE user_id = $1 AND status = 'queued'
+                      ORDER BY queue_position ASC, created_at ASC
+                      LIMIT 1
+                      FOR UPDATE SKIP LOCKED
+                 )
+                RETURNING job_id, dry_run
+            """, user_id)
+
+            if not row:
+                break
+
+            job_meta = await conn.fetchrow("""
+                SELECT j.title, j.company, j.location, j.url, j.source, j.description
+                  FROM jobs j WHERE j.id = $1
+            """, row["job_id"])
+            if not job_meta:
+                # Orphaned application row — mark failed and move on.
+                await conn.execute(
+                    "UPDATE applications SET status = 'failed', notes = 'Job no longer exists' "
+                    "WHERE user_id = $1 AND job_id = $2",
+                    user_id, row["job_id"],
+                )
+                continue
+
+        # Lazy import to avoid circular dependency
+        from api.routes.apply import run_application
+        job_dict = {
+            "id": row["job_id"],
+            "title": job_meta["title"],
+            "company": job_meta["company"],
+            "location": job_meta["location"],
+            "url": job_meta["url"],
+            "source": job_meta["source"],
+            "description": job_meta["description"],
+        }
+        try:
+            # Per-domain throttle: no more than MAX_CONCURRENT_PER_DOMAIN (2)
+            # in-flight applications to the same ATS host, with a 15-60s jitter
+            # cooldown before the next one in the queue can grab the slot.
+            # This is the single biggest behavioral change that drops the
+            # "20 applies from one IP in 5 minutes" bot signature.
+            async with throttle_for_url(job_meta["url"]):
+                await asyncio.wait_for(
+                    run_application(job_dict, user_id, bool(row["dry_run"])),
+                    timeout=APPLICATION_TIMEOUT,
+                )
+        except asyncio.TimeoutError:
+            print(f"  ✗ Application timed out after {APPLICATION_TIMEOUT}s for job {row['job_id']}")
             pool = await get_pool()
             async with pool.acquire() as conn:
-                row = await conn.fetchrow("""
-                    SELECT a.job_id, a.dry_run,
-                           j.title, j.company, j.location,
-                           j.url, j.source, j.description
-                    FROM applications a
-                    JOIN jobs j ON j.id = a.job_id
-                    WHERE a.user_id = $1 AND a.status = 'queued'
-                    ORDER BY a.queue_position ASC, a.created_at ASC
-                    LIMIT 1
-                """, user_id)
-
-                if not row:
-                    break
-
-                # Mark as applying before we release the DB connection
-                # Also reset applied_at to NOW() so the 10-min cleanup uses a fresh timestamp
-                # (created_at is from when the job was scored, possibly days ago)
                 await conn.execute("""
-                    UPDATE applications SET status = 'applying', notes = 'Starting...', applied_at = NOW()
-                    WHERE user_id = $1 AND job_id = $2 AND status = 'queued'
+                    UPDATE applications SET status = 'failed', notes = 'Timed out after 5 minutes'
+                    WHERE user_id = $1 AND job_id = $2
                 """, user_id, row["job_id"])
-
-            # Lazy import to avoid circular dependency
-            from api.routes.apply import run_application
-            job_dict = {
-                "id": row["job_id"],
-                "title": row["title"],
-                "company": row["company"],
-                "location": row["location"],
-                "url": row["url"],
-                "source": row["source"],
-                "description": row["description"],
-            }
-            try:
-                # Per-domain throttle: no more than MAX_CONCURRENT_PER_DOMAIN (2)
-                # in-flight applications to the same ATS host, with a 15-60s jitter
-                # cooldown before the next one in the queue can grab the slot.
-                # This is the single biggest behavioral change that drops the
-                # "20 applies from one IP in 5 minutes" bot signature.
-                async with throttle_for_url(row["url"]):
-                    await asyncio.wait_for(
-                        run_application(job_dict, user_id, bool(row["dry_run"])),
-                        timeout=APPLICATION_TIMEOUT,
-                    )
-            except asyncio.TimeoutError:
-                print(f"  ✗ Application timed out after {APPLICATION_TIMEOUT}s for job {row['job_id']}")
-                pool = await get_pool()
-                async with pool.acquire() as conn:
-                    await conn.execute("""
-                        UPDATE applications SET status = 'failed', notes = 'Timed out after 5 minutes'
-                        WHERE user_id = $1 AND job_id = $2
-                    """, user_id, row["job_id"])
-            except Exception as e:
-                print(f"  ✗ Queue processor error: {e}")
-                pool = await get_pool()
-                async with pool.acquire() as conn:
-                    await conn.execute("""
-                        UPDATE applications SET status = 'failed', notes = $3
-                        WHERE user_id = $1 AND job_id = $2
-                    """, user_id, row["job_id"], f"Error: {e}")
+        except Exception as e:
+            print(f"  ✗ Queue processor error: {e}")
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE applications SET status = 'failed', notes = $3
+                    WHERE user_id = $1 AND job_id = $2
+                """, user_id, row["job_id"], f"Error: {e}")
 
 
 @router.get("/")

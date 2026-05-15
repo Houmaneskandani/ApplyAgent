@@ -49,7 +49,7 @@ async def get_jobs(min_score: int = 1, limit: int = 100, user=Depends(get_curren
         user_id = int(user["user_id"])
         apps = await conn.fetch(
             """
-            SELECT job_id, score, status, applied_at
+            SELECT job_id, score, status, applied_at, notes
             FROM applications
             WHERE user_id = $1 AND score >= $2
             ORDER BY score DESC
@@ -79,6 +79,7 @@ async def get_jobs(min_score: int = 1, limit: int = 100, user=Depends(get_curren
             if job:
                 job["score"] = app["score"]
                 job["status"] = app["status"]
+                job["notes"] = app["notes"]
                 job["applied_at"] = str(app["applied_at"]) if app["applied_at"] else None
                 job["experience_level"] = detect_experience_level(
                     job.get("title", ""), job.get("description", "")
@@ -108,6 +109,10 @@ async def get_stats(user=Depends(get_current_user)):
             "SELECT COUNT(*) FROM applications WHERE user_id = $1 AND status = 'applied'",
             user["user_id"],
         )
+        unknown = await conn.fetchval(
+            "SELECT COUNT(*) FROM applications WHERE user_id = $1 AND status = 'unknown'",
+            user["user_id"],
+        )
         credits = await conn.fetchval(
             "SELECT COALESCE(credits, 0) FROM users WHERE id = $1", user["user_id"]
         )
@@ -135,6 +140,7 @@ async def get_stats(user=Depends(get_current_user)):
             "scored": scored,
             "strong_matches": strong,
             "applied": applied,
+            "unknown": unknown,
             "credits": round(float(credits or 0), 1),
             "last_scraped": last_scraped_str,
             "last_scraped_ago": time_ago(last_scraped) if last_scraped else "Never",
