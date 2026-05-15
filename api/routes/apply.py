@@ -278,6 +278,28 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
             "imap_pass": _decrypt(prefs.get("imap_pass", "")),
         }
 
+        # Read-and-clear the force_submit flag atomically. If the user
+        # clicked "Submit anyway" on a reviewer-blocked apply, this run
+        # bypasses the reviewer; the flag resets so a future normal retry
+        # gets the audit again. Doing it in one UPDATE prevents the flag
+        # from leaking across retries on a transient queue restart.
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                fs_row = await conn.fetchrow("""
+                    UPDATE applications SET force_submit = FALSE
+                     WHERE user_id = $1 AND job_id = $2 AND force_submit = TRUE
+                    RETURNING force_submit
+                """, user_id, job_id)
+            if fs_row is not None:
+                user_info["_force_submit"] = True
+                print(f"  🔓 Force-submit flag consumed for user={user_id} job={job_id} "
+                      f"— reviewer will be bypassed this run.")
+        except Exception as _e:
+            # Defensive: never let force-submit infra break the apply. If
+            # the read-and-clear fails, fall through with reviewer enabled.
+            print(f"  ⚠ force_submit read-and-clear failed: {type(_e).__name__}: {_e}")
+
         await _set_step(user_id, job_id, "Reading resume...")
         profile_text = build_profile_text(user, prefs)
         resume_text = extract_resume_text(tmp_resume_path)
@@ -413,12 +435,71 @@ async def confirm_unknown_apply(job_id: int, request: Request, user=Depends(get_
     return {"status": "applied", "credit_deducted": deducted}
 
 
+@router.post("/{job_id}/force-submit")
+@_rate_limit("10/minute")
+async def force_submit_apply(job_id: int, request: Request, user=Depends(get_current_user)):
+    """
+    User overrides a reviewer-blocked apply by clicking "Submit anyway".
+    Re-queues the application with `force_submit = TRUE`, which run_application
+    reads-and-clears atomically and passes to the reviewer as `_force_submit`
+    in user_info; the reviewer then short-circuits with no block.
+
+    Only valid when the current row is in `unknown` (reviewer blocked) or
+    `failed` (e.g., transient submit error). We don't allow force-submit
+    from `new` / `queued` / `applying` — those should go through normal
+    /apply with full reviewer auditing.
+    """
+    user_id = user["user_id"]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT status FROM applications WHERE user_id = $1 AND job_id = $2",
+            user_id, job_id,
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Application not found")
+        if existing["status"] not in ("unknown", "failed"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Force-submit only allowed for 'unknown' or 'failed' applications "
+                    f"(current: {existing['status']})"
+                ),
+            )
+        # Compute the queue position inside the same transaction as the
+        # status flip so concurrent /force-submit + /apply requests can't
+        # both observe the same COUNT.
+        async with conn.transaction():
+            cnt_row = await conn.fetchrow("""
+                SELECT COUNT(*) AS cnt FROM applications
+                WHERE user_id = $1 AND status IN ('queued', 'applying')
+            """, user_id)
+            position = (cnt_row["cnt"] or 0) + 1
+            await conn.execute("""
+                UPDATE applications
+                   SET status = 'queued',
+                       notes = 'Force-submit queued (reviewer bypassed)',
+                       force_submit = TRUE,
+                       dry_run = FALSE,
+                       queue_position = $3
+                 WHERE user_id = $1 AND job_id = $2
+            """, user_id, job_id, position)
+    # Kick the per-user queue worker. asyncio.create_task is fire-and-forget
+    # which is fine — the worker is responsible for its own lifecycle and
+    # idempotency (per-user asyncio.Lock + DB-level FOR UPDATE SKIP LOCKED).
+    import asyncio as _asyncio
+    from api.routes.queue import process_user_queue
+    _asyncio.create_task(process_user_queue(user_id))
+    return {"status": "queued", "queue_position": position}
+
+
 @router.post("/{job_id}/retry")
 @_rate_limit("20/minute")
 async def retry_application(job_id: int, request: Request, user=Depends(get_current_user)):
     """
     Reset an `unknown` or `failed` row back to `new` so the user can re-queue it.
     Does NOT charge a credit (the new apply will charge if it succeeds).
+    Also clears `force_submit` so a subsequent normal retry uses the reviewer.
     """
     user_id = user["user_id"]
     pool = await get_pool()
@@ -435,7 +516,8 @@ async def retry_application(job_id: int, request: Request, user=Depends(get_curr
                 detail=f"Cannot retry — application is {existing['status']}",
             )
         await conn.execute(
-            "UPDATE applications SET status = 'new', notes = NULL WHERE user_id = $1 AND job_id = $2",
+            "UPDATE applications SET status = 'new', notes = NULL, force_submit = FALSE "
+            "WHERE user_id = $1 AND job_id = $2",
             user_id, job_id,
         )
     return {"status": "reset"}
