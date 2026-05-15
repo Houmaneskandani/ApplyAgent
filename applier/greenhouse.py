@@ -292,30 +292,50 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
         used_uids = set()
 
     print(f"    📧 Polling {imap_user} for Greenhouse verification email (up to {wait_sec}s)...")
+    # Connection cadence: open ONE IMAP connection and keep it open across
+    # ticks. Previously we did mail.login() every 5 seconds — that's ~18
+    # logins per apply, and Google's abuse detection flags this pattern
+    # and starts rejecting auth with AUTHENTICATIONFAILED. Now: one login
+    # per apply, NOOP between ticks to keep the connection warm, and only
+    # reconnect on actual connection errors.
     elapsed = 0
-    for tick in range(wait_sec // 5):
-        await asyncio.sleep(5)
-        elapsed += 5
+    mail = None
+    POLL_INTERVAL = 8  # was 5 — slow down a bit to be even gentler on Gmail
+    ticks_total = max(1, wait_sec // POLL_INTERVAL)
+    for tick in range(ticks_total):
+        await asyncio.sleep(POLL_INTERVAL)
+        elapsed += POLL_INTERVAL
         print(f"    ⏳ [{elapsed}s] Checking inbox...")
         try:
-            mail = imaplib.IMAP4_SSL("imap.gmail.com")
-            mail.login(imap_user, imap_pass)
-            # INBOX first — verification emails should always be there because
-            # they're transactional. Also some accounts have "Show in IMAP"
-            # disabled for the All Mail label, which makes a folder select
-            # silently succeed but searches return nothing.
-            # If INBOX gives no hits later, the search falls through to
-            # All Mail as a wider net (Promotions/Updates/Spam).
-            select_result, _ = mail.select("INBOX", readonly=False)
-            if select_result != "OK":
-                print(f"    ⚠ Could not select INBOX, falling back to All Mail")
-                mail.select('"[Gmail]/All Mail"')
+            # Reuse the connection from previous ticks. Only login on the
+            # FIRST tick (or after a connection error). Calling NOOP keeps
+            # the connection alive without re-authenticating.
+            if mail is None:
+                mail = imaplib.IMAP4_SSL("imap.gmail.com")
+                mail.login(imap_user, imap_pass)
+                # INBOX first — verification emails should always be there
+                # because they're transactional. Some accounts have "Show
+                # in IMAP" disabled for All Mail, which makes a folder
+                # select silently succeed but searches return nothing.
+                select_result, _ = mail.select("INBOX", readonly=False)
+                if select_result != "OK":
+                    print(f"    ⚠ Could not select INBOX, falling back to All Mail")
+                    mail.select('"[Gmail]/All Mail"')
+            else:
+                # Keep-alive — don't re-login, just confirm the server's there
+                try:
+                    mail.noop()
+                except Exception:
+                    # Connection dropped — start fresh
+                    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+                    mail.login(imap_user, imap_pass)
+                    mail.select("INBOX", readonly=False)
 
             since_str = since_dt.strftime("%d-%b-%Y")
             seen_nums = set()
             # First tick only: log how many emails are in the mailbox total
             # (sanity check for "is IMAP even seeing my mail").
-            if elapsed == 5:
+            if elapsed == POLL_INTERVAL:
                 try:
                     _, all_msgs = mail.search(None, "ALL")
                     print(f"    🔎 IMAP sees {len(all_msgs[0].split()) if all_msgs[0] else 0} emails in current folder")

@@ -736,7 +736,33 @@ async def _solve_with_capsolver(page, api_key: str, source: str = "") -> tuple[s
     if captcha_type == "hcaptcha":
         task = {"type": "HCaptchaTaskProxyless", "websiteURL": url, "websiteKey": site_key}
     elif captcha_type == "recaptchav2":
-        task = {"type": "ReCaptchaV2TaskProxyless", "websiteURL": url, "websiteKey": site_key}
+        # Detect invisible reCAPTCHA v2. Capsolver rejects with
+        # "Invalid input, please check captcha type ... and invisible"
+        # if we send a checkbox task for an invisible widget. Telltale
+        # signs of invisible v2: data-size="invisible" attribute on the
+        # widget, or "isInvisible" / "invisible_captcha" string anywhere
+        # in page content.
+        is_invisible = False
+        try:
+            invisible_count = await page.locator(
+                ".g-recaptcha[data-size='invisible'], [data-size='invisible']"
+            ).count()
+            if invisible_count > 0:
+                is_invisible = True
+            else:
+                content = await page.content()
+                if 'data-size="invisible"' in content or "size: 'invisible'" in content:
+                    is_invisible = True
+        except Exception:
+            pass
+        task = {
+            "type": "ReCaptchaV2TaskProxyless",
+            "websiteURL": url,
+            "websiteKey": site_key,
+            "isInvisible": is_invisible,
+        }
+        if is_invisible:
+            print(f"    → reCAPTCHA v2 INVISIBLE variant — sending isInvisible=true")
     elif captcha_type == "recaptchav3":
         task = {"type": "ReCaptchaV3TaskProxyless", "websiteURL": url,
                 "websiteKey": site_key, "pageAction": "submit", "minScore": 0.5}
