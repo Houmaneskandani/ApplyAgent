@@ -53,6 +53,12 @@ async def init_db():
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credits FLOAT DEFAULT 100")
         await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS queue_position INTEGER DEFAULT 0")
         await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS dry_run BOOLEAN DEFAULT TRUE")
+        # `force_submit` is a one-shot flag: the /force-submit endpoint sets
+        # it to TRUE when the user overrides a reviewer-blocked apply
+        # ("Submit anyway"). run_application reads-and-clears it atomically
+        # at the start of each attempt so it can't accidentally persist
+        # across normal retries.
+        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS force_submit BOOLEAN DEFAULT FALSE")
         # Reset any jobs that were mid-apply when server last restarted
         await conn.execute("""
             UPDATE applications SET status = 'failed', notes = 'Server restarted during apply'
