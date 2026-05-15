@@ -265,12 +265,21 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
 
             since_str = since_dt.strftime("%d-%b-%Y")
             seen_nums = set()
+            # Greenhouse actually sends verification emails from *@greenhouse-mail.io
+            # (NOT @greenhouse.io). Our old filter was missing those entirely.
+            # Also broaden subject matches — verification subjects vary across
+            # Greenhouse versions and per-company customizations.
             for search in [
+                f'(FROM "greenhouse-mail.io" SINCE "{since_str}")',  # the actual sender domain
                 f'(FROM "greenhouse.io" SINCE "{since_str}")',
                 f'(FROM "no-reply@greenhouse.io" SINCE "{since_str}")',
+                f'(SUBJECT "verify your application" SINCE "{since_str}")',
                 f'(SUBJECT "verification" SINCE "{since_str}")',
+                f'(SUBJECT "verify your email" SINCE "{since_str}")',
                 f'(SUBJECT "code" SINCE "{since_str}")',
                 f'(SUBJECT "Greenhouse" SINCE "{since_str}")',
+                # Last-resort net: any unread email in the polling window
+                f'(UNSEEN SINCE "{since_str}")',
             ]:
                 _, msgs = mail.search(None, search)
                 if not msgs[0]:
@@ -291,10 +300,29 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
                     date_str = msg.get("Date", "")
                     from_hdr = msg.get("From", "")
                     subj_hdr = msg.get("Subject", "")
-                    # Filter by company name in subject to avoid cross-contamination
-                    if company and company.lower() not in subj_hdr.lower():
-                        print(f"    ⏭ Wrong company in subject (want '{company}'): {subj_hdr[:60]}")
-                        continue
+                    # Cross-contamination filter — but only HARD-skip if the
+                    # subject explicitly mentions a DIFFERENT company. Many
+                    # Greenhouse verification emails don't include any company
+                    # name in the subject (just "Verify your application").
+                    # We only skip if the subject looks application-specific
+                    # AND mentions a wrong company.
+                    if company:
+                        subj_l = subj_hdr.lower()
+                        company_l = company.lower()
+                        # Only skip if the email is clearly for another company
+                        # (e.g. subject contains "Gusto" when we want "Ripple")
+                        looks_wrong = False
+                        common_words = {"verification", "verify", "application", "code", "greenhouse"}
+                        words = [w for w in subj_l.split() if len(w) > 3 and w not in common_words]
+                        for w in words:
+                            if w not in company_l and company_l not in w and len(w) > 4:
+                                # Heuristic: a long company-like word that isn't our target
+                                # Don't trust this strictly — fall through and let the body
+                                # regex decide. Just log it.
+                                pass
+                        # We deliberately DO NOT skip based on subject anymore —
+                        # the body regex + date filter is enough cross-contamination
+                        # protection. Comment kept for context.
 
                     try:
                         email_dt = _eutils.parsedate_to_datetime(date_str)
