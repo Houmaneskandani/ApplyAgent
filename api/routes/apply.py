@@ -31,14 +31,53 @@ def extract_resume_text(pdf_path: str) -> str:
 router = APIRouter()
 
 
+async def _mint_fresh_resume_url(stored_url: str) -> str:
+    """
+    The resume_url we persist in users.resume_url is a signed Supabase URL,
+    but Phase 1 cut signed-URL lifetime from 365 days to 1 hour for security.
+    Old URLs in the DB are now expired (they 400 / 403 on download). Plus,
+    Supabase invalidates signed tokens when the project is paused/resumed
+    (which happened here when the user's trial expired). So before
+    downloading, derive the storage path from the URL and mint a fresh
+    short-lived signed URL.
+    """
+    import os, re
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return stored_url  # nothing we can do; fall back to the stored value
+    m = re.search(r"/resumes/([^?]+)", stored_url or "")
+    if not m:
+        return stored_url
+    storage_path = m.group(1)
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        signed = sb.storage.from_("resumes").create_signed_url(
+            storage_path, 60 * 5  # 5 min — long enough to download, no longer
+        )
+        return signed.get("signedURL") or signed.get("signedUrl") or stored_url
+    except Exception as e:
+        print(f"  ⚠ Could not mint fresh signed URL: {e} — using stored URL")
+        return stored_url
+
+
 async def download_resume(resume_url: str) -> str:
     """Download resume from Supabase Storage to a temp file, return local path."""
-    async with httpx.AsyncClient() as client:
-        r = await client.get(resume_url)
+    fresh_url = await _mint_fresh_resume_url(resume_url)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.get(fresh_url)
         if r.status_code != 200:
             raise Exception(f"Failed to download resume: {r.status_code}")
 
-        suffix = ".pdf" if "pdf" in resume_url.lower() else ".docx"
+        # Try Content-Type first, fall back to URL hint
+        ct = (r.headers.get("content-type") or "").lower()
+        if "pdf" in ct:
+            suffix = ".pdf"
+        elif "wordprocessing" in ct or "msword" in ct:
+            suffix = ".docx"
+        else:
+            suffix = ".pdf" if "pdf" in fresh_url.lower() else ".docx"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         tmp.write(r.content)
         tmp.close()
