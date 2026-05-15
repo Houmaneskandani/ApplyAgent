@@ -898,69 +898,36 @@ async def handle_errors_and_retry(frame, page, max_retries: int = 5, profile_tex
     submitting and surface the issues in the Needs Review tab.
     """
     from datetime import datetime, timezone, timedelta
-    from applier.reviewer import (
-        extract_filled_form_values,
-        review_form,
-        format_issues_for_notes,
-    )
+    from applier.reviewer import run_pre_submit_review
 
     info = user_info or {}
     if session_start is None:
         session_start = datetime.now(timezone.utc)
     submit_time: datetime | None = None  # set just before each Submit click
     used_uids: set = set()  # track email UIDs already used so we never reuse a code
-    reviewer_notes: str = ""  # populated if the reviewer blocked the submit
 
     # ── Pre-submit review (runs once, before the first submit attempt) ──
-    # The form is already filled at this point. Walk the DOM, get every
-    # filled-in value, send it to Claude for a second-pair-of-eyes audit.
-    # If "fail" → don't submit, return "unknown" with the issues attached.
-    try:
-        print("    🔍 Reviewer auditing filled form before submit...")
-        filled = await extract_filled_form_values(frame)
-        if filled:
-            print(f"    🔍 Reviewer found {len(filled)} filled fields — sending to Claude...")
-            verdict = await review_form(
-                field_values=filled,
-                profile_text=profile_text or "",
-                company=company or "",
-                job_title=job_title or "",
-            )
-            v = verdict.get("verdict", "warn")
-            summary = verdict.get("summary", "")
-            issues = verdict.get("issues", [])
-            blockers = [i for i in issues if i.get("severity") == "blocker"]
-            print(f"    🔍 Reviewer verdict: {v.upper()} — {summary}")
-            for i in issues[:5]:
-                sev = i.get("severity", "")
-                marker = "✗" if sev == "blocker" else "⚠"
-                print(f"      {marker} {i.get('field', '?')[:50]}: entered '{i.get('entered', '')[:50]}' (expected '{i.get('expected', '')[:50]}')")
-
-            if v == "fail" and blockers:
-                print(f"    ✗ Reviewer BLOCKED submission ({len(blockers)} blockers) — routing to Needs Review")
-                reviewer_notes = format_issues_for_notes(verdict)
-                # Stash notes on user_info so apply.py can write them to the
-                # applications.notes column. Cleaner than coupling greenhouse.py
-                # directly to the DB layer.
-                if info is not None:
-                    info["_reviewer_notes"] = f"Reviewer blocked: {reviewer_notes}"
-                # Save a screenshot so the user can see exactly what the
-                # form looked like at the moment the reviewer blocked it.
-                try:
-                    await page.screenshot(path=f"screenshots/reviewer_blocked_{int(session_start.timestamp())}.png")
-                except Exception:
-                    pass
-                # Return "unknown" so apply.py routes this to Needs Review
-                # without charging a credit. The user sees the issues and
-                # can fix their profile + retry.
-                return "unknown"
-            elif v == "warn":
-                print(f"    ⚠ Reviewer warnings but proceeding to submit (warnings, not blockers).")
-        else:
-            print("    ⚠ Reviewer skipped: no filled fields detected (form may be in iframe we couldn't read)")
-    except Exception as _e:
-        # Reviewer is BEST-EFFORT — never block the apply on its own bug.
-        print(f"    ⚠ Reviewer error (continuing anyway): {type(_e).__name__}: {_e}")
+    # The form is filled at this point. The helper walks the DOM (inside
+    # the frame because Greenhouse iframes its form), sends every value
+    # to Claude for an audit, and on `fail` stashes notes on user_info
+    # so apply.py can surface them in the Needs Review tab.
+    #
+    # We pass `page` as `page_for_screenshot` so the helper can still
+    # capture the visible state — Frames don't have a .screenshot() method.
+    blocked = await run_pre_submit_review(
+        frame,
+        user_info=info,
+        profile_text=profile_text,
+        company=company or "",
+        job_title=job_title or "",
+        screenshot_prefix="reviewer_blocked",
+        page_for_screenshot=page,
+    )
+    if blocked:
+        # Return "unknown" so apply.py routes this to Needs Review
+        # without charging a credit. The user sees the issues and
+        # can fix their profile + retry.
+        return "unknown"
 
     for attempt in range(max_retries):
         # Re-acquire frame on every attempt — React re-renders can make old reference stale
