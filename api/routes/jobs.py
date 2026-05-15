@@ -244,6 +244,103 @@ async def per_ats_stats(user=Depends(get_current_user)):
     return {"per_ats": out, "total_attempts": sum(x["total"] for x in out)}
 
 
+@router.get("/stats/by-ats-with-samples")
+async def by_ats_with_samples(user=Depends(get_current_user)):
+    """
+    Per-ATS job counts + a shortlist of candidate jobs to test against.
+
+    Mirrors the dispatcher logic in apply.py:run_application — same
+    source/URL patterns — so the "ats" bucket returned here is exactly
+    which applier code path will fire if the user clicks Apply on one
+    of these jobs.
+
+    For each ATS, returns up to 3 sample jobs ranked by:
+      1. NOT yet applied / queued / unknown (skip already-attempted rows)
+      2. Highest user-specific score (most worth applying to)
+      3. Most recently scraped (posting most likely still open)
+
+    Used by the dashboard's ATS validation flow: the user picks one
+    sample per ATS, runs a dry-run on each, and checks the screenshot
+    / logs to find ATS-specific bugs before doing a real apply.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            WITH classified AS (
+                SELECT
+                    j.id, j.title, j.company, j.url, j.source, j.created_at,
+                    a.score, a.status,
+                    CASE
+                        WHEN j.source = 'greenhouse'
+                          OR j.url LIKE '%greenhouse.io%'
+                          OR j.url LIKE '%gh_jid%'
+                            THEN 'greenhouse'
+                        WHEN j.source = 'lever'
+                          OR j.url LIKE '%lever.co%'
+                            THEN 'lever'
+                        WHEN j.source = 'ashby'
+                          OR j.url LIKE '%ashby.io%'
+                          OR j.url LIKE '%ashbyhq.com%'
+                            THEN 'ashby'
+                        WHEN j.source = 'smartrecruiters'
+                          OR j.url LIKE '%smartrecruiters.com%'
+                            THEN 'smartrecruiters'
+                        WHEN j.source = 'workday'
+                          OR j.url LIKE '%myworkdayjobs.com%'
+                          OR j.url LIKE '%workday.com%'
+                            THEN 'workday'
+                        ELSE 'generic'
+                    END AS ats
+                  FROM jobs j
+                  LEFT JOIN applications a
+                    ON a.job_id = j.id AND a.user_id = $1
+            ),
+            ranked AS (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY ats
+                        ORDER BY
+                            -- Untouched rows first; already-attempted last
+                            CASE WHEN status IS NULL OR status = 'new' THEN 0 ELSE 1 END,
+                            COALESCE(score, 0) DESC,
+                            created_at DESC
+                    ) AS rn,
+                    COUNT(*) OVER (PARTITION BY ats) AS ats_total
+                FROM classified
+            )
+            SELECT ats, ats_total, id, title, company, url, source, score, status
+              FROM ranked
+             WHERE rn <= 3
+             ORDER BY ats_total DESC, ats, rn
+        """, user["user_id"])
+
+    # Re-shape: { ats: { total, samples: [...] } } keeping the
+    # `ats_total DESC` ordering of the outer list so the most-stocked
+    # ATSes appear first in the validation shortlist.
+    grouped: dict[str, dict] = {}
+    order: list[str] = []
+    for r in rows:
+        ats = r["ats"]
+        if ats not in grouped:
+            grouped[ats] = {
+                "ats": ats,
+                "total": int(r["ats_total"] or 0),
+                "samples": [],
+            }
+            order.append(ats)
+        grouped[ats]["samples"].append({
+            "id": r["id"],
+            "title": r["title"],
+            "company": r["company"],
+            "url": r["url"],
+            "scrape_source": r["source"],
+            "score": int(r["score"]) if r["score"] is not None else None,
+            "status": r["status"] or "new",
+        })
+
+    return {"per_ats": [grouped[a] for a in order]}
+
+
 @router.post("/scrape")
 async def trigger_scrape(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     """Kick off a full scrape + rescore in the background."""
