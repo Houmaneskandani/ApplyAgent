@@ -190,6 +190,60 @@ async def get_stats(user=Depends(get_current_user)):
         }
 
 
+@router.get("/stats/per-ats")
+async def per_ats_stats(user=Depends(get_current_user)):
+    """
+    Aggregate apply outcomes by ATS (job source). Returns one row per
+    source the user has at least one real attempt on, sorted by total
+    attempts descending.
+
+    Only counts LIVE applies (`dry_run = FALSE`) — dry runs would
+    inflate the "applied" count without representing real submissions.
+    Excludes `queued` / `applying` / `new` so we only aggregate
+    terminal outcomes.
+
+    Used by the Dashboard's "Apply performance by ATS" widget so the
+    user can see which ATSes the bot is reliable on (high success rate)
+    vs. which need investigation (lots of failed/unknown).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+              COALESCE(j.source, 'unknown') AS source,
+              COUNT(*) FILTER (WHERE a.status = 'applied') AS applied,
+              COUNT(*) FILTER (WHERE a.status = 'failed')  AS failed,
+              COUNT(*) FILTER (WHERE a.status = 'unknown') AS unknown,
+              COUNT(*) AS total
+              FROM applications a
+              JOIN jobs j ON j.id = a.job_id
+             WHERE a.user_id = $1
+               AND a.dry_run = FALSE
+               AND a.status IN ('applied', 'failed', 'unknown')
+             GROUP BY j.source
+             ORDER BY total DESC, applied DESC
+        """, user["user_id"])
+
+    out = []
+    for r in rows:
+        total = int(r["total"] or 0)
+        applied = int(r["applied"] or 0)
+        # Success rate is `applied / total`. Excludes `unknown` from
+        # the denominator? No — we keep it in. Unknowns mean we tried
+        # and couldn't confirm; from a reliability lens that's still
+        # a failed attempt until the user manually confirms it.
+        success_rate = round(100.0 * applied / total, 1) if total else None
+        out.append({
+            "source": r["source"],
+            "applied": applied,
+            "failed": int(r["failed"] or 0),
+            "unknown": int(r["unknown"] or 0),
+            "total": total,
+            "success_rate_pct": success_rate,
+        })
+    return {"per_ats": out, "total_attempts": sum(x["total"] for x in out)}
+
+
 @router.post("/scrape")
 async def trigger_scrape(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     """Kick off a full scrape + rescore in the background."""
