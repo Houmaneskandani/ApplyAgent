@@ -41,14 +41,13 @@ if SENTRY_DSN:
     except Exception as e:
         print(f"  ⚠ Sentry init failed: {e}")
 
-from api.auth import router as auth_router, get_current_user  # noqa: E402
+from api.auth import router as auth_router  # noqa: E402  (imports must follow validation)
 from api.routes.jobs import router as jobs_router  # noqa: E402
 from api.routes.apply import router as apply_router  # noqa: E402
 from api.routes.profile import router as profile_router  # noqa: E402
 from api.routes.credits import router as credits_router  # noqa: E402
 from api.routes.queue import router as queue_router  # noqa: E402
 from api.routes.auto_apply import router as auto_apply_router  # noqa: E402
-from fastapi import Depends  # noqa: E402
 
 
 # Whether the web service should also run the scheduler loop. By default OFF,
@@ -137,33 +136,6 @@ _BOOT_TIME = time.time()
 @app.get("/")
 async def root():
     return {"status": "JobBot API running"}
-
-
-@app.get("/sentry-debug")
-async def sentry_debug(user=Depends(get_current_user)):
-    """
-    Verification endpoint for the Sentry integration. Triggers a deliberate
-    error so we can confirm events are landing in the Sentry dashboard.
-
-    SECURITY: requires a valid JWT — without auth, anyone on the internet
-    could hammer this and burn through the Sentry free-tier event quota
-    (or worse, fingerprint our error-reporting setup). Remove this endpoint
-    entirely once you've confirmed Sentry is healthy.
-    """
-    if SENTRY_DSN:
-        import sentry_sdk
-        # Send a structured log so we can verify the Logs surface too.
-        try:
-            sentry_sdk.logger.info(
-                "sentry-debug hit by user_id=%s", user["user_id"],
-            )
-        except AttributeError:
-            # Older sentry-sdk releases lack the new logger API; ignore.
-            pass
-    # Trigger an unhandled exception — Sentry will capture this and attach
-    # the request transaction.
-    division_by_zero = 1 / 0
-    return {"ok": True, "trigger": division_by_zero}  # unreachable
 
 
 @app.get("/health")
