@@ -1,5 +1,8 @@
 import asyncio
+import hashlib
 import os
+import re
+import time
 import anthropic
 from playwright.async_api import async_playwright
 from config import ANTHROPIC_API_KEY
@@ -7,10 +10,70 @@ from applier.browser_utils import stealth_session, wait_for_captcha_if_present, 
 
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
+# ─── get_answer cache ───────────────────────────────────────────────────
+#
+# Why: across ~50 Greenhouse/Ashby/Lever applications the same questions
+# show up over and over — gender, race, veteran status, sponsorship,
+# acknowledgment-of-EEO policy, etc. Previously each application paid full
+# Claude tokens to answer them again. Now we cache (question, field_type,
+# profile_hash) -> answer for 24 hours; the same profile asking the same
+# question gets an instant cached reply.
+#
+# The cache key includes a hash of profile_text so that a profile update
+# transparently invalidates all stale answers.
+_ANSWER_CACHE: dict[tuple[str, str, str], tuple[str, float]] = {}
+_ANSWER_CACHE_TTL = 60 * 60 * 24  # 24 hours
+_ANSWER_CACHE_MAX = 2000          # rough cap to avoid unbounded growth
+
+
+def _profile_hash(profile_text: str) -> str:
+    """Stable short hash of the profile content used as a cache partition key."""
+    if not profile_text:
+        return "_"
+    return hashlib.sha256(profile_text.encode("utf-8")).hexdigest()[:16]
+
+
+def _normalize_question(q: str) -> str:
+    """Strip whitespace + lowercase so 'Are you a veteran? ' and 'are you a veteran?' share a cache slot."""
+    return re.sub(r"\s+", " ", (q or "").strip().lower())
+
+
+def _cache_get(question: str, field_type: str, profile_text: str) -> str | None:
+    key = (_normalize_question(question), field_type, _profile_hash(profile_text))
+    hit = _ANSWER_CACHE.get(key)
+    if hit is None:
+        return None
+    answer, ts = hit
+    if time.time() - ts > _ANSWER_CACHE_TTL:
+        _ANSWER_CACHE.pop(key, None)
+        return None
+    return answer
+
+
+def _cache_set(question: str, field_type: str, profile_text: str, answer: str) -> None:
+    if not answer:
+        return
+    if len(_ANSWER_CACHE) >= _ANSWER_CACHE_MAX:
+        # Evict the oldest entry (simple FIFO; not LRU but cheap and adequate)
+        oldest = min(_ANSWER_CACHE.items(), key=lambda kv: kv[1][1], default=None)
+        if oldest:
+            _ANSWER_CACHE.pop(oldest[0], None)
+    key = (_normalize_question(question), field_type, _profile_hash(profile_text))
+    _ANSWER_CACHE[key] = (answer, time.time())
+
+
 async def get_answer(question: str, field_type: str, profile_text: str = None) -> str:
     if not profile_text:
         raise ValueError("profile_text is required — no hardcoded profile fallback")
     profile = profile_text
+
+    # Cache hit — return without burning a Claude token. EEOC/sponsorship/
+    # consent answers are stable across applications for a given profile,
+    # so this is a major cost reduction on the second+ application.
+    cached = _cache_get(question, field_type, profile_text)
+    if cached is not None:
+        return cached
+
     prompt = f"""
 You are an expert job application assistant filling out a form on behalf of this candidate:
 
@@ -80,7 +143,9 @@ CRITICAL RULES — you will be penalized for breaking these:
                 max_tokens=200,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return message.content[0].text.strip()
+            answer = message.content[0].text.strip()
+            _cache_set(question, field_type, profile_text, answer)
+            return answer
         except Exception as e:
             err = str(e)
             if "rate_limit" in err or "429" in err:
