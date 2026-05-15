@@ -117,9 +117,23 @@ async def _walk_workday_wizard(page, info: dict, profile_text: str, dry_run: boo
             print(f"    ✓ DRY RUN — screenshot saved")
             return "dry_run"
 
-        # Try to click Next / Continue / Submit
-        advanced = await _click_next_or_submit(page, step)
+        # Try to click Next / Continue / Submit. We pass user_info /
+        # profile_text / job through so the helper can run the pre-submit
+        # reviewer agent — but ONLY on the final "Submit" click (the
+        # helper inspects the button text to decide).
+        advanced = await _click_next_or_submit(
+            page, step, user_info=info, profile_text=profile_text, job=job,
+        )
         if not advanced:
+            # Distinguish reviewer-block from genuine "no button found".
+            # The helper sets `_reviewer_blocked_workday` on user_info
+            # when its False return is actually a reviewer veto, not a
+            # missing button. Map that to "unknown" so apply.py routes
+            # it to Needs Review (with the existing reviewer notes the
+            # helper already stashed via run_pre_submit_review).
+            if info.get("_reviewer_blocked_workday"):
+                print("    ✗ Reviewer blocked the final Workday submit — routing to Needs Review")
+                return "unknown"
             print("    ✗ Could not advance — no Next/Submit button found")
             try:
                 await page.screenshot(path=f"screenshots/workday_stuck_{step}.png")
@@ -327,18 +341,27 @@ async def _fill_workday_generic_questions(page, info: dict, profile_text: str):
             print(f"    ✗ Radio error: {e}")
 
 
-async def _click_next_or_submit(page, step: int) -> bool:
+async def _click_next_or_submit(
+    page,
+    step: int,
+    user_info: dict | None = None,
+    profile_text: str | None = None,
+    job: dict | None = None,
+) -> bool:
     """Click the Next or Submit button to advance the Workday wizard.
 
-    TODO (reviewer): Workday's wizard calls this on EVERY step (Next, Next,
-    ..., Submit). The pre-submit reviewer should run ONCE, just before the
-    final Submit — not on every Next click (each call costs ~$0.01 + 10s).
-    Detecting "this is the final step" requires reading the button text
-    of whichever candidate locator matched. Defer until we have a real
-    Workday application to test against; for now the reviewer is wired
-    into Lever / Ashby / SmartRecruiters / Generic / Greenhouse.
+    Runs the pre-submit reviewer agent ONLY when the matched button is
+    actually a "Submit" (not a "Next" / "Continue" / "Save and Continue").
+    Workday calls this helper on every step transition, so a naive
+    integration would burn ~$0.01 + 10s on every Next click.
+
+    Detection: we read the visible button's text after locating it and
+    compare to a known set of final-submit labels. If the user_info or
+    profile_text aren't supplied (legacy callers), the reviewer is
+    skipped entirely.
     """
-    # Prefer "Submit" on later steps
+    # Try Submit first (so on the last step we click it before falling
+    # through to Next selectors that might also match).
     candidates = [
         "button:has-text('Submit'):visible",
         "button:has-text('Save and Continue'):visible",
@@ -348,13 +371,46 @@ async def _click_next_or_submit(page, step: int) -> bool:
         "[data-automation-id='bottom-navigation-save-button']:visible",
         "button[aria-label*='Next']:visible",
     ]
+    # Labels we consider a "final submit" (case-insensitive, stripped).
+    FINAL_SUBMIT_LABELS = {"submit", "submit application", "submit my application"}
+
     for sel in candidates:
         try:
             btn = page.locator(sel)
-            if await btn.count() > 0:
-                print(f"    → Clicking: {sel.split(':')[0]}")
-                await btn.first.click()
-                return True
+            if await btn.count() == 0:
+                continue
+            # Read the actual button text to decide if this is the FINAL
+            # submit vs. an intermediate Next. The selector "has-text('Submit')"
+            # would also match "Save and Submit Later", so don't trust the
+            # selector — trust the rendered text.
+            try:
+                btn_text = (await btn.first.inner_text() or "").strip().lower()
+            except Exception:
+                btn_text = ""
+            is_final_submit = btn_text in FINAL_SUBMIT_LABELS
+
+            if is_final_submit and user_info is not None and profile_text is not None:
+                from applier.reviewer import run_pre_submit_review
+                blocked = await run_pre_submit_review(
+                    page,
+                    user_info=user_info,
+                    profile_text=profile_text,
+                    company=(job or {}).get("company", ""),
+                    job_title=(job or {}).get("title", ""),
+                    screenshot_prefix="workday_reviewer_blocked",
+                )
+                if blocked:
+                    # Signal to the caller we got blocked, NOT that we failed
+                    # to advance — _walk_workday_wizard treats the False
+                    # return as "failed", which is wrong. Stash a sentinel
+                    # in user_info so the caller can distinguish.
+                    user_info["_reviewer_blocked_workday"] = True
+                    return False
+
+            print(f"    → Clicking: {sel.split(':')[0]}  "
+                  f"({'FINAL SUBMIT' if is_final_submit else 'next'})")
+            await btn.first.click()
+            return True
         except Exception:
             continue
     return False
