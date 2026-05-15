@@ -529,11 +529,65 @@ async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = No
                 job_id = job.get('id', 'unknown')
 
                 print(f"    → Loading: {job['url']}")
-                await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
-                await asyncio.sleep(2)
+                # Try the original wrapper URL first. If the wrapper page
+                # fails to load at all (HTTP/2 protocol error, Cloudflare
+                # challenge, DNS, etc), skip straight to the direct
+                # Greenhouse URL via gh_jid — that's the form we ultimately
+                # need anyway. Real example: Roblox's careers.roblox.com
+                # returns ERR_HTTP2_PROTOCOL_ERROR for some sessions.
+                wrapper_ok = False
+                try:
+                    await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+                    wrapper_ok = True
+                except Exception as e:
+                    print(f"    ⚠ Wrapper page failed to load ({type(e).__name__}: {str(e)[:80]}) — trying direct Greenhouse URL")
+                    import re as _re_jid_init
+                    m = _re_jid_init.search(r"gh_jid=(\d+)", job.get("url", ""))
+                    if not m:
+                        # No gh_jid to fall back to — re-raise
+                        raise
+                    gh_jid = m.group(1)
+                    company_slug = job.get("company", "").lower().replace(" ", "")
+                    direct_loaded = False
+                    for direct in [
+                        f"https://job-boards.greenhouse.io/{company_slug}/jobs/{gh_jid}",
+                        f"https://boards.greenhouse.io/{company_slug}/jobs/{gh_jid}",
+                        f"https://job-boards.greenhouse.io/embed/job_app?for={company_slug}&token={gh_jid}",
+                    ]:
+                        try:
+                            print(f"    → Trying direct URL: {direct[:70]}")
+                            await page.goto(direct, timeout=30000, wait_until="domcontentloaded")
+                            await asyncio.sleep(2)
+                            # Confirm form actually loaded
+                            form_exists = await page.locator("input#first_name, input[name='first_name']").count()
+                            if form_exists > 0:
+                                print(f"    ✓ Direct URL bypassed wrapper successfully")
+                                direct_loaded = True
+                                break
+                        except Exception as ee:
+                            print(f"    ⚠ Direct URL also failed: {type(ee).__name__}")
+                            continue
+                    if not direct_loaded:
+                        raise  # bubble up the original wrapper error
                 await page.screenshot(path=f"screenshots/gh_{job_id}_1_loaded.png")
                 await wait_for_captcha_if_present(page)
 
+                # If we already loaded the direct Greenhouse URL (because
+                # the wrapper failed), we're already on the form — skip the
+                # Apply-button search and go straight to filling.
+                apply_clicked = not wrapper_ok
+                if not apply_clicked:
+                    # Already-loaded form has the first_name input visible.
+                    # Verify and skip the Apply button search if we landed
+                    # on it for any other reason (e.g., direct URL given).
+                    try:
+                        ff = page.locator("input#first_name, input[name='first_name']")
+                        if await ff.count() > 0 and await ff.first.is_visible():
+                            apply_clicked = True
+                            print("    ✓ Already on the application form — no Apply button click needed")
+                    except Exception:
+                        pass
                 # Find a VISIBLE apply button. The previous selector
                 # `a:has-text('Apply'), button:has-text('Apply')` was too greedy:
                 # on MongoDB's careers page it matched a hidden
@@ -545,8 +599,8 @@ async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = No
                 #   3. Skip known filter-button IDs
                 #   4. If nothing works on the wrapper page, fall back to the
                 #      direct Greenhouse-hosted URL via gh_jid
-                apply_clicked = False
-                for selector in [
+                # If we already arrived directly on the form, skip selector loop.
+                button_selectors = [] if apply_clicked else [
                     "a:has-text('Apply for this job'):visible",
                     "button:has-text('Apply for this job'):visible",
                     "a:has-text('Apply now'):visible",
@@ -556,7 +610,8 @@ async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = No
                     # Generic, but visible-only AND excluding known filter ids
                     "a:has-text('Apply'):visible:not(#filter-apply-handler)",
                     "button:has-text('Apply'):visible:not(#filter-apply-handler):not([id*='filter']):not([id*='search'])",
-                ]:
+                ]
+                for selector in button_selectors:
                     btn = page.locator(selector)
                     try:
                         count = await btn.count()
