@@ -6,16 +6,42 @@ router = APIRouter()
 
 
 def detect_experience_level(title: str, description: str = "") -> str:
+    """
+    Heuristic seniority detection. Returns one of the values in the
+    EXPERIENCE_LEVELS frontend filter so the filter actually matches.
+    """
     text = f"{title} {description}".lower()
     if any(w in text for w in ["staff", "principal", "distinguished", "fellow"]):
         return "Staff / Principal"
     if any(w in text for w in ["senior", "sr.", "sr ", "lead", "manager"]):
         return "Senior"
+    if any(w in text for w in ["intern", "new grad", "graduate", "entry"]):
+        return "Entry"  # NOTE: previously returned "Junior" — broke the Entry filter
+    if any(w in text for w in ["junior", "jr.", "jr ", "associate"]):
+        return "Junior"
     if any(w in text for w in ["mid", "mid-level", "intermediate", "ii", "iii"]):
         return "Mid Level"
-    if any(w in text for w in ["junior", "jr.", "jr ", "associate", "entry", "new grad", "graduate", "intern"]):
-        return "Junior"
     return "Mid Level"  # default
+
+
+def detect_work_arrangement(title: str, location: str = "", description: str = "") -> str:
+    """
+    Detect Remote / Hybrid / Onsite from title + location + description.
+
+    Why this matters: the previous frontend filter inferred this from the
+    location string alone — but most hybrid jobs say "San Francisco, CA"
+    with no "hybrid" word, and most in-person jobs ALSO have no marker.
+    Folding the description into the detection catches "Remote position",
+    "hybrid 3 days in office", etc.
+    """
+    text = f"{title} {location} {description}".lower()
+    # Order matters — check Hybrid before Remote so "hybrid (remote 2 days)"
+    # is classified as Hybrid, not Remote.
+    if any(w in text for w in ["hybrid", "in-office", "3 days in office", "2 days in office", "in office"]):
+        return "Hybrid"
+    if any(w in text for w in ["remote", "work from home", "wfh", "anywhere", "distributed"]):
+        return "Remote"
+    return "Onsite"
 
 
 def time_ago(dt) -> str:
@@ -81,12 +107,29 @@ async def get_jobs(min_score: int = 1, limit: int = 100, user=Depends(get_curren
                 job["status"] = app["status"]
                 job["notes"] = app["notes"]
                 job["applied_at"] = str(app["applied_at"]) if app["applied_at"] else None
+                desc = job.get("description", "") or ""
                 job["experience_level"] = detect_experience_level(
-                    job.get("title", ""), job.get("description", "")
+                    job.get("title", ""), desc,
+                )
+                # New: explicit work arrangement so the frontend doesn't have to
+                # guess from a substring match on location.
+                job["work_arrangement"] = detect_work_arrangement(
+                    job.get("title", ""), job.get("location", "") or "", desc,
                 )
                 job["posted_at"] = time_ago(job.get("created_at"))
                 raw_dt = job.get("created_at")
                 job["created_at"] = raw_dt.isoformat() if raw_dt else None
+                # We strip the full description from the list response (it
+                # bloats the payload + can be MBs of HTML). But we DO emit a
+                # plain-text snippet so the frontend keyword filter can match
+                # description text without re-fetching every job.
+                if desc:
+                    import re as _re
+                    snippet = _re.sub(r"<[^>]+>", " ", desc)  # strip HTML tags
+                    snippet = _re.sub(r"\s+", " ", snippet).strip()
+                    job["description_snippet"] = snippet[:600].lower()
+                else:
+                    job["description_snippet"] = ""
                 job.pop("description", None)
                 result.append(job)
 
