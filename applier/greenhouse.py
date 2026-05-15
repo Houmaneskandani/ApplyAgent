@@ -186,11 +186,29 @@ RULES:
 - Textarea fields: 3-5 sentences, professional and genuine
 - Dropdown/radio/checkbox: reply with the exact best option text
 - Sponsorship/visa questions: if work_auth is citizen or authorized → "No"
-- Acknowledgment/consent/compliance questions → always "Yes"
 - "How did you hear about us" → "Online job search"
 - Demographic (gender/race/disability/veteran): use exact profile values, pick "decline" if profile says decline
 - School not in dropdown list → pick "Other"
 - If unsure → give best short professional answer
+
+CRITICAL — ACKNOWLEDGMENT / COMPLIANCE / POLICY questions → ALWAYS "Yes":
+These are statements the company asks you to confirm understanding of.
+Examples (recognize ANY of these patterns — they're ALWAYS Yes):
+- Starts with "I acknowledge", "I agree", "I confirm", "I understand",
+  "I certify", "I authorize", "I consent"
+- Starts with the COMPANY NAME followed by "adheres to", "is committed to",
+  "complies with", "requires", "expects", "has a policy"
+  (e.g. "Robinhood adheres to applicable laws...", "Stripe is committed to
+  equal employment opportunity..." → ALWAYS "Yes")
+- Mentions "background check", "drug test", "equal opportunity",
+  "anti-discrimination", "anti-harassment", "laws and regulations",
+  "company policies", "code of conduct"
+- Asks if you understand a work arrangement (hybrid/office/travel/schedule)
+- Asks if you authorize the company to verify/contact references
+
+The candidate already chose to apply, so they accept these terms.
+NEVER answer "No" to an acknowledgment question unless the candidate's
+profile explicitly says they refuse it.
 
 Reply ONLY with valid JSON. No explanation. No markdown. Example:
 {{"1": "Yes", "2": "5 years", "3": "I am authorized to work in the US"}}"""

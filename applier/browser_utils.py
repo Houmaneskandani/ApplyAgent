@@ -640,6 +640,29 @@ async def _solve_with_capsolver(page, api_key: str, source: str = "") -> tuple[s
     url = page.url
     print(f"    → {captcha_type} detected (key: {site_key[:8]}...) — sending to Capsolver")
 
+    # Sitekey-length sanity check. If we never extracted a real key,
+    # Capsolver will reject with "invalid websiteKey, length should be 40"
+    # — and the rejection round-trip takes 1-3 seconds each time.
+    # Recaptcha v2/v3 keys are always 40 chars; hCaptcha is 36; Turnstile
+    # starts with "0x". If the extracted key doesn't match, skip Capsolver
+    # entirely. The page probably mentions "recaptcha" in a footer or
+    # analytics script but doesn't actually use one — common false alarm.
+    EXPECTED_KEY_LEN = {
+        "hcaptcha": (32, 40),       # usually 36, allow some slack
+        "recaptchav2": (40, 40),
+        "recaptchav3": (40, 40),
+        "turnstile": (8, 60),       # starts with 0x, length varies
+    }
+    if captcha_type in EXPECTED_KEY_LEN:
+        lo, hi = EXPECTED_KEY_LEN[captcha_type]
+        if not site_key or not (lo <= len(site_key) <= hi):
+            print(
+                f"    ✗ Sitekey looks invalid (len={len(site_key)}; need {lo}-{hi}) "
+                f"— page probably doesn't have a real {captcha_type} widget. "
+                f"Skipping Capsolver."
+            )
+            return ("", "")
+
     if captcha_type == "hcaptcha":
         task = {"type": "HCaptchaTaskProxyless", "websiteURL": url, "websiteKey": site_key}
     elif captcha_type == "recaptchav2":
