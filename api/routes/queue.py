@@ -6,8 +6,12 @@ from applier.browser_utils import throttle_for_url
 
 router = APIRouter()
 
-# Max seconds a single application can run before being force-killed
-APPLICATION_TIMEOUT = 300  # 5 minutes
+# Max seconds a single application can run before being force-killed.
+# Long-form Greenhouse jobs (Robinhood/Stripe/Pinterest) routinely have
+# 15-25 custom questions, plus email verification waits up to 90s, plus
+# 2-3 CAPTCHA detection rounds. 5 min was too tight; 10 min gives the
+# longest jobs room to finish but still kills genuinely-stuck runs.
+APPLICATION_TIMEOUT = 600  # 10 minutes
 
 
 async def process_user_queue(user_id: int):
@@ -107,14 +111,17 @@ async def get_queue(user=Depends(get_current_user)):
     user_id = user["user_id"]
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Auto-reset any jobs stuck in 'applying' for more than 10 minutes
-        # Use applied_at (set to NOW() when we started applying) not created_at
+        # Auto-reset any jobs stuck in 'applying' for more than 15 minutes.
+        # This is the SAFETY NET — APPLICATION_TIMEOUT (10 min) should catch
+        # everything first, but if the worker crashed mid-apply and never
+        # updated status, this stops the row from staying 'applying' forever.
+        # Use applied_at (set to NOW() when we started applying) not created_at.
         await conn.execute("""
             UPDATE applications
-            SET status = 'failed', notes = 'Timed out — no response after 10 minutes'
+            SET status = 'failed', notes = 'Timed out — no response after 15 minutes'
             WHERE user_id = $1
               AND status = 'applying'
-              AND applied_at < NOW() - INTERVAL '10 minutes'
+              AND applied_at < NOW() - INTERVAL '15 minutes'
         """, user_id)
 
         rows = await conn.fetch("""
