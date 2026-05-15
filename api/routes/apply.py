@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException
-from api.auth import get_current_user
+from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, Request
+from api.auth import get_current_user, _rate_limit
 from db import get_pool, update_application_status, get_user_credits, deduct_credits
 from applier.greenhouse import apply_greenhouse
 from applier.lever import apply_lever
@@ -357,7 +357,8 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
 
 
 @router.post("/{job_id}/confirm")
-async def confirm_unknown_apply(job_id: int, user=Depends(get_current_user)):
+@_rate_limit("20/minute")
+async def confirm_unknown_apply(job_id: int, request: Request, user=Depends(get_current_user)):
     """
     User manually confirmed that an `unknown` apply landed successfully.
     Promote the row to `applied` and charge the credit (the bot did the
@@ -397,7 +398,8 @@ async def confirm_unknown_apply(job_id: int, user=Depends(get_current_user)):
 
 
 @router.post("/{job_id}/retry")
-async def retry_application(job_id: int, user=Depends(get_current_user)):
+@_rate_limit("20/minute")
+async def retry_application(job_id: int, request: Request, user=Depends(get_current_user)):
     """
     Reset an `unknown` or `failed` row back to `new` so the user can re-queue it.
     Does NOT charge a credit (the new apply will charge if it succeeds).
@@ -424,8 +426,10 @@ async def retry_application(job_id: int, user=Depends(get_current_user)):
 
 
 @router.post("/{job_id}")
+@_rate_limit("10/minute")
 async def apply_to_job(
     job_id: int,
+    request: Request,
     background_tasks: BackgroundTasks,
     dry_run: bool = True,
     user=Depends(get_current_user),

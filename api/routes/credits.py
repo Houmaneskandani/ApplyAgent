@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
-from api.auth import get_current_user
+from api.auth import get_current_user, _rate_limit
 from db import get_user_credits, add_credits, get_pool
 from config import STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, FRONTEND_URL
 
@@ -24,7 +24,8 @@ async def get_packages():
 
 
 @router.post("/checkout/{package_id}")
-async def create_checkout(package_id: str, user=Depends(get_current_user)):
+@_rate_limit("10/minute")
+async def create_checkout(package_id: str, request: Request, user=Depends(get_current_user)):
     if not STRIPE_SECRET_KEY:
         raise HTTPException(status_code=503, detail="Payments not configured yet")
 

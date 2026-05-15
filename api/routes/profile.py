@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks
-from api.auth import get_current_user
+from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, BackgroundTasks, Request
+from api.auth import get_current_user, _rate_limit
 from db import get_pool
 from matcher import score_jobs
 from secrets_crypto import encrypt, decrypt
@@ -63,26 +63,53 @@ def _parse_prefs(raw) -> dict:
     return raw
 
 
-def _encrypt_secret_prefs(prefs: dict) -> dict:
-    """Encrypt designated secret fields in-place before persisting."""
+def _strip_secret_prefs(prefs: dict) -> dict:
+    """
+    Build the client-safe view of preferences: strip every secret field and
+    replace it with a `<key>_set: bool` flag. The UI uses that flag to render
+    a "✓ Saved — enter new to change" hint without ever seeing the plaintext.
+
+    Previously this function (then `_redact_secret_prefs`) DECRYPTED the IMAP
+    password and shipped it cleartext to the browser on every GET /profile/.
+    That meant the password sat in:
+      - HTTPS response body (visible in devtools Network tab)
+      - React state in memory
+      - Possibly the browser's password autofill / history
+    and was exfiltratable by any future XSS. The new contract is: secrets are
+    write-only over the API. To rotate, the user types a new value; to keep
+    the existing value, they leave the field empty (PUT merge logic below).
+    """
     out = dict(prefs or {})
     for k in ENCRYPTED_PREF_KEYS:
-        v = out.get(k)
-        if v and isinstance(v, str):
-            # Re-encrypt if plaintext, or leave alone if already encrypted.
-            from secrets_crypto import is_encrypted
-            if not is_encrypted(v):
-                out[k] = encrypt(v)
+        v = out.pop(k, None)
+        out[f"{k}_set"] = bool(v)
     return out
 
 
-def _redact_secret_prefs(prefs: dict) -> dict:
-    """Decrypt for the owner — they can see/edit their own secrets."""
-    out = dict(prefs or {})
+def _merge_secret_prefs(new_prefs: dict, existing_prefs: dict) -> dict:
+    """
+    For every ENCRYPTED_PREF_KEY: if the client sent an empty/missing value
+    but we already have an encrypted value in the DB, preserve the existing
+    encrypted blob. Otherwise (non-empty new value), encrypt & store the new
+    one. This is what makes "leave the field blank to keep your password"
+    work for the UI.
+    """
+    from secrets_crypto import is_encrypted
+    out = dict(new_prefs or {})
     for k in ENCRYPTED_PREF_KEYS:
-        v = out.get(k)
-        if v and isinstance(v, str):
-            out[k] = decrypt(v)
+        new_v = out.get(k)
+        # Treat None / empty string / whitespace-only as "user didn't change it"
+        is_empty = not isinstance(new_v, str) or not new_v.strip()
+        if is_empty:
+            existing_v = (existing_prefs or {}).get(k)
+            if existing_v:
+                out[k] = existing_v   # preserve existing (already-encrypted)
+            else:
+                out.pop(k, None)      # nothing here, nothing to store
+        else:
+            # New non-empty value — encrypt if not already encrypted.
+            if not is_encrypted(new_v):
+                out[k] = encrypt(new_v)
     return out
 
 
@@ -103,8 +130,12 @@ async def get_profile(user=Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="User not found")
         result = dict(row)
         prefs = _parse_prefs(result.get("preferences"))
-        # Decrypt so the owner sees their own values in the form.
-        result["preferences"] = _redact_secret_prefs(prefs)
+        # SECURITY: strip all encrypted secrets (e.g. imap_pass). The UI gets
+        # boolean `<key>_set` flags so it can show a "saved" indicator without
+        # the cleartext value ever crossing the network or sitting in browser
+        # memory. To rotate a saved secret the user types a new value and the
+        # PUT merge logic encrypts + replaces.
+        result["preferences"] = _strip_secret_prefs(prefs)
         return result
 
 
@@ -133,18 +164,29 @@ async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Dep
         raise HTTPException(status_code=413, detail=f"Preferences too large ({len(encoded)} bytes; max 65536)")
 
     try:
-        prefs_encrypted = _encrypt_secret_prefs(prefs_in)
-    except Exception as e:
-        print(f"  [PUT /profile/] ENCRYPT FAILED user={user_id}: {type(e).__name__}: {e}")
-        raise HTTPException(status_code=500, detail=f"Encryption error: {type(e).__name__}")
-
-    try:
         pool = await get_pool()
         async with pool.acquire() as conn:
+            # Fetch the existing encrypted prefs so we can preserve secrets
+            # the user didn't change. (UI sends imap_pass='' to mean "keep
+            # what's already there" since we never ship the cleartext.)
+            existing_row = await conn.fetchrow(
+                "SELECT preferences FROM users WHERE id = $1", user_id,
+            )
+            existing_prefs = _parse_prefs(existing_row["preferences"]) if existing_row else {}
+            try:
+                prefs_encrypted = _merge_secret_prefs(prefs_in, existing_prefs)
+            except Exception as e:
+                print(f"  [PUT /profile/] ENCRYPT FAILED user={user_id}: {type(e).__name__}: {e}")
+                raise HTTPException(status_code=500, detail=f"Encryption error: {type(e).__name__}")
             await conn.execute("""
                 UPDATE users SET name = COALESCE($1, name), preferences = $2
                 WHERE id = $3
             """, name, json.dumps(prefs_encrypted), user_id)
+    except HTTPException:
+        # Don't re-wrap an HTTPException raised inside the try (e.g. by the
+        # encryption block) as a generic "DB error" — let it pass through
+        # with its own status code + detail.
+        raise
     except Exception as e:
         print(f"  [PUT /profile/] DB UPDATE FAILED user={user_id}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"DB error: {type(e).__name__}")
@@ -157,7 +199,9 @@ async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Dep
 
 
 @router.post("/resume")
+@_rate_limit("5/minute")
 async def upload_resume(
+    request: Request,
     file: UploadFile = File(...),
     background_tasks: BackgroundTasks = None,
     user=Depends(get_current_user),
@@ -217,8 +261,14 @@ async def upload_resume(
 
 
 @router.post("/test-imap")
-async def test_imap(user=Depends(get_current_user)):
-    """Test whether the user's saved IMAP credentials work."""
+@_rate_limit("5/minute")
+async def test_imap(request: Request, user=Depends(get_current_user)):
+    """Test whether the user's saved IMAP credentials work.
+
+    SECURITY: tight rate limit (5/min). Google flags repeated IMAP logins as
+    suspicious and burns App Passwords; without this an attacker who got
+    a JWT could intentionally trigger lockouts.
+    """
     import imaplib
     pool = await get_pool()
     async with pool.acquire() as conn:
