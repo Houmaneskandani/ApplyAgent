@@ -6,7 +6,7 @@ import asyncio
 import os
 from playwright.async_api import async_playwright
 from applier.greenhouse import get_answer
-from applier.browser_utils import new_stealth_page, wait_for_captcha_if_present
+from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 os.makedirs("screenshots", exist_ok=True)
 
@@ -20,53 +20,53 @@ async def apply_smartrecruiters(job: dict, dry_run: bool = True, user_info: dict
     print(f"  URL: {job['url']}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await new_stealth_page(browser)
-
-        try:
-            print(f"    → Loading: {job['url']}")
-            await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await wait_for_captcha_if_present(page, source="smartrecruiters")
-
-            # Click the Apply button
-            apply_btn = page.locator(
-                "button:has-text('Apply now'), button:has-text('Apply Now'), "
-                "a:has-text('Apply now'), a:has-text('Apply Now'), "
-                "button:has-text('Apply'), a:has-text('Apply'), "
-                "[data-hook='apply-button']"
-            )
-            if await apply_btn.count() > 0:
-                await apply_btn.first.click()
-                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+        async with stealth_session(
+            p, url=job["url"], user_id=info.get("user_id"),
+        ) as (_browser, _context, page):
+            try:
+                print(f"    → Loading: {job['url']}")
+                await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
                 await asyncio.sleep(2)
                 await wait_for_captcha_if_present(page, source="smartrecruiters")
-                print("    ✓ Clicked Apply")
-            else:
-                print("    ℹ No Apply button found — form may already be visible")
 
-            await _fill_sr_form(page, info, profile_text)
-            print("    ✓ Form filled!")
+                # Click the Apply button
+                apply_btn = page.locator(
+                    "button:has-text('Apply now'), button:has-text('Apply Now'), "
+                    "a:has-text('Apply now'), a:has-text('Apply Now'), "
+                    "button:has-text('Apply'), a:has-text('Apply'), "
+                    "[data-hook='apply-button']"
+                )
+                if await apply_btn.count() > 0:
+                    await apply_btn.first.click()
+                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                    await asyncio.sleep(2)
+                    await wait_for_captcha_if_present(page, source="smartrecruiters")
+                    print("    ✓ Clicked Apply")
+                else:
+                    print("    ℹ No Apply button found — form may already be visible")
 
-            if dry_run:
-                await page.screenshot(path=f"screenshots/sr_dry_{job.get('id', 'unknown')}.png", full_page=True)
-                print(f"    ✓ DRY RUN — screenshot saved")
-                return "dry_run"
-            else:
-                return await _submit_sr(page, job)
+                await _fill_sr_form(page, info, profile_text)
+                print("    ✓ Form filled!")
 
-        except Exception as e:
-            import traceback
-            print(f"    ✗ Error: {e}")
-            traceback.print_exc()
-            try:
-                await page.screenshot(path=f"screenshots/sr_error_{job.get('id', 'unknown')}.png")
-            except Exception:
-                pass
-            return "failed"
-        finally:
-            await asyncio.sleep(2)
-            await browser.close()
+                if dry_run:
+                    await page.screenshot(path=f"screenshots/sr_dry_{job.get('id', 'unknown')}.png", full_page=True)
+                    print(f"    ✓ DRY RUN — screenshot saved")
+                    return "dry_run"
+                else:
+                    return await _submit_sr(page, job)
+
+            except Exception as e:
+                import traceback
+                print(f"    ✗ Error: {e}")
+                traceback.print_exc()
+                try:
+                    await page.screenshot(path=f"screenshots/sr_error_{job.get('id', 'unknown')}.png")
+                except Exception:
+                    pass
+                return "failed"
+            finally:
+                await asyncio.sleep(2)
+                # browser/context cleanup is handled by stealth_session
 
 
 async def _fill_sr_form(page, info: dict, profile_text: str):
@@ -225,7 +225,7 @@ async def _fill_sr_custom_questions(page, profile_text: str):
 
             for r, lbl in options:
                 if answer.lower() in lbl.lower() or lbl.lower() in answer.lower():
-                    await r.evaluate("el => el.click()")
+                    await trusted_click(r)
                     print(f"    ✓ Radio: {lbl}")
                     break
         except Exception as e:

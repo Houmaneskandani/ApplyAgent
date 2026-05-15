@@ -4,7 +4,7 @@ import anthropic
 from playwright.async_api import async_playwright
 from config import ANTHROPIC_API_KEY
 from applier.greenhouse import get_answer
-from applier.browser_utils import new_stealth_page, wait_for_captcha_if_present
+from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -19,77 +19,77 @@ async def apply_lever(job: dict, dry_run: bool = True, user_info: dict = None, p
     print(f"  URL: {job['url']}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await new_stealth_page(browser)
-
-        try:
-            await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await wait_for_captcha_if_present(page, source="lever")
-
-            # Try clicking the Apply button first
-            apply_btn = page.locator(
-                "a:has-text('Apply for this job'), "
-                "button:has-text('Apply for this job'), "
-                "a:has-text('Apply now'), "
-                "button:has-text('Apply now'), "
-                "a:has-text('Apply'), "
-                "button:has-text('Apply')"
-            )
-
-            clicked = False
-            if await apply_btn.count() > 0:
-                try:
-                    await apply_btn.first.click(timeout=5000)
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                    await asyncio.sleep(2)
-                    await wait_for_captcha_if_present(page, source="lever")
-                    print("    ✓ Clicked Apply button")
-                    clicked = True
-                except Exception as e:
-                    print(f"    ✗ Apply button click failed: {e}")
-
-            # Fallback: navigate directly to /apply URL
-            if not clicked:
-                apply_url = job["url"].rstrip("/") + "/apply"
-                print(f"    → Navigating directly to apply URL: {apply_url}")
-                await page.goto(apply_url, timeout=60000, wait_until="domcontentloaded")
-                await asyncio.sleep(2)
-
-            # Verify we're on the form page
-            current_url = page.url
-            print(f"    ℹ Current URL: {current_url[:80]}")
-
-            # Solve any CAPTCHA on the apply form itself (hCaptcha blocks clicks)
-            await asyncio.sleep(2)
-            await wait_for_captcha_if_present(page, source="lever")
-
-            await fill_lever_form(page, user_info=info, profile_text=profile_text)
-
-            print("    ✓ Form filled!")
-
-            if dry_run:
-                os.makedirs("screenshots", exist_ok=True)
-                screenshot_path = f"screenshots/dry_run_{job.get('id', 'unknown')}.png"
-                await page.screenshot(path=screenshot_path, full_page=True)
-                print(f"    ✓ DRY RUN — screenshot saved to {screenshot_path}")
-            else:
-                result = await submit_lever(page)
-                return result
-
-        except Exception as e:
-            import traceback
-            print(f"    ✗ Error: {e}")
-            traceback.print_exc()
+        async with stealth_session(
+            p, url=job["url"], user_id=info.get("user_id"),
+        ) as (_browser, _context, page):
             try:
-                await page.screenshot(path=f"screenshots/lever_error_{job.get('id', 'unknown')}.png")
-                print(f"    → Screenshot: screenshots/lever_error_{job.get('id', 'unknown')}.png")
-            except Exception:
-                pass
-            return "failed"
-        finally:
-            await asyncio.sleep(3)  # pause so you can see the final state
-            await browser.close()
+                await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await wait_for_captcha_if_present(page, source="lever")
+
+                # Try clicking the Apply button first
+                apply_btn = page.locator(
+                    "a:has-text('Apply for this job'), "
+                    "button:has-text('Apply for this job'), "
+                    "a:has-text('Apply now'), "
+                    "button:has-text('Apply now'), "
+                    "a:has-text('Apply'), "
+                    "button:has-text('Apply')"
+                )
+
+                clicked = False
+                if await apply_btn.count() > 0:
+                    try:
+                        await apply_btn.first.click(timeout=5000)
+                        await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                        await asyncio.sleep(2)
+                        await wait_for_captcha_if_present(page, source="lever")
+                        print("    ✓ Clicked Apply button")
+                        clicked = True
+                    except Exception as e:
+                        print(f"    ✗ Apply button click failed: {e}")
+
+                # Fallback: navigate directly to /apply URL
+                if not clicked:
+                    apply_url = job["url"].rstrip("/") + "/apply"
+                    print(f"    → Navigating directly to apply URL: {apply_url}")
+                    await page.goto(apply_url, timeout=60000, wait_until="domcontentloaded")
+                    await asyncio.sleep(2)
+
+                # Verify we're on the form page
+                current_url = page.url
+                print(f"    ℹ Current URL: {current_url[:80]}")
+
+                # Solve any CAPTCHA on the apply form itself (hCaptcha blocks clicks)
+                await asyncio.sleep(2)
+                await wait_for_captcha_if_present(page, source="lever")
+
+                await fill_lever_form(page, user_info=info, profile_text=profile_text)
+
+                print("    ✓ Form filled!")
+
+                if dry_run:
+                    os.makedirs("screenshots", exist_ok=True)
+                    screenshot_path = f"screenshots/dry_run_{job.get('id', 'unknown')}.png"
+                    await page.screenshot(path=screenshot_path, full_page=True)
+                    print(f"    ✓ DRY RUN — screenshot saved to {screenshot_path}")
+                else:
+                    result = await submit_lever(page)
+                    return result
+
+            except Exception as e:
+                import traceback
+                print(f"    ✗ Error: {e}")
+                traceback.print_exc()
+                try:
+                    await page.screenshot(path=f"screenshots/lever_error_{job.get('id', 'unknown')}.png")
+                    print(f"    → Screenshot: screenshots/lever_error_{job.get('id', 'unknown')}.png")
+                except Exception:
+                    pass
+                return "failed"
+            finally:
+                await asyncio.sleep(3)  # pause so you can see the final state
+                # cleanup handled by stealth_session
 
     return "dry_run"
 
@@ -251,8 +251,9 @@ async def fill_lever_custom_questions(page, profile_text: str = None):
             clicked = False
             for radio, val, lbl in options:
                 if answer.lower() in lbl.lower() or lbl.lower() in answer.lower():
-                    # Use JS click to bypass any CAPTCHA overlay intercepting pointer events
-                    await radio.evaluate("el => el.click()")
+                    # Trusted click — Lever's hCaptcha integration rejects synthetic
+                    # (isTrusted=false) events, which is what the old JS click produced.
+                    await trusted_click(radio)
                     print(f"    ✓ Radio: {lbl}")
                     clicked = True
                     break
@@ -260,7 +261,7 @@ async def fill_lever_custom_questions(page, profile_text: str = None):
                 # fuzzy fallback: pick first matching word
                 for radio, val, lbl in options:
                     if any(w in lbl.lower() for w in answer.lower().split()):
-                        await radio.evaluate("el => el.click()")
+                        await trusted_click(radio)
                         print(f"    ✓ Radio (fuzzy): {lbl}")
                         break
         except Exception as e:
@@ -311,11 +312,11 @@ async def fill_lever_custom_questions(page, profile_text: str = None):
                     w in lbl.lower() for w in answer_lower.split(",")
                     if len(w.strip()) > 3
                 ):
-                    await cb.evaluate("el => el.click()")
+                    await trusted_click(cb)
                     print(f"    ✓ Checked: {lbl}")
                     checked += 1
             if checked == 0 and options:
-                await options[0][0].evaluate("el => el.click()")
+                await trusted_click(options[0][0])
                 print(f"    ✓ Checked (fallback): {options[0][2]}")
         except Exception as e:
             print(f"    ✗ Checkbox group error: {e}")

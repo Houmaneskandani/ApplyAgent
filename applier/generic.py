@@ -7,7 +7,7 @@ import asyncio
 import os
 from playwright.async_api import async_playwright
 from applier.greenhouse import get_answer
-from applier.browser_utils import new_stealth_page, wait_for_captcha_if_present
+from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 os.makedirs("screenshots", exist_ok=True)
 
@@ -35,62 +35,62 @@ async def apply_generic(job: dict, dry_run: bool = True, user_info: dict = None,
     print(f"  URL: {job['url']}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await new_stealth_page(browser)
-
-        try:
-            print(f"    → Loading: {job['url']}")
-            await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await wait_for_captcha_if_present(page, source="generic")
-
-            # Try to find and click an Apply button
-            apply_btn = page.locator(
-                "a:has-text('Apply now'), button:has-text('Apply now'), "
-                "a:has-text('Apply for this job'), button:has-text('Apply for this job'), "
-                "a:has-text('Apply'), button:has-text('Apply'), "
-                "[class*='apply-btn'], [id*='apply-btn'], [aria-label*='Apply']"
-            )
-            if await apply_btn.count() > 0:
-                try:
-                    await apply_btn.first.click()
-                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                    await asyncio.sleep(2)
-                    await wait_for_captcha_if_present(page, source="generic")
-                    print("    ✓ Clicked Apply")
-                except Exception as e:
-                    print(f"    ✗ Apply click failed: {e}")
-            else:
-                print("    ℹ No Apply button — attempting to fill visible form")
-
-            # Check if a form is present at all
-            form_count = await page.locator("form").count()
-            if form_count == 0:
-                print("    ✗ No form found on page")
-                return "unsupported"
-
-            await _fill_generic_form(page, info, profile_text)
-            print("    ✓ Form filled!")
-
-            if dry_run:
-                await page.screenshot(path=f"screenshots/generic_dry_{job.get('id', 'unknown')}.png", full_page=True)
-                print(f"    ✓ DRY RUN — screenshot saved")
-                return "dry_run"
-            else:
-                return await _submit_generic(page, job)
-
-        except Exception as e:
-            import traceback
-            print(f"    ✗ Error: {e}")
-            traceback.print_exc()
+        async with stealth_session(
+            p, url=job["url"], user_id=info.get("user_id"),
+        ) as (_browser, _context, page):
             try:
-                await page.screenshot(path=f"screenshots/generic_error_{job.get('id', 'unknown')}.png")
-            except Exception:
-                pass
-            return "failed"
-        finally:
-            await asyncio.sleep(2)
-            await browser.close()
+                print(f"    → Loading: {job['url']}")
+                await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await wait_for_captcha_if_present(page, source="generic")
+
+                # Try to find and click an Apply button
+                apply_btn = page.locator(
+                    "a:has-text('Apply now'), button:has-text('Apply now'), "
+                    "a:has-text('Apply for this job'), button:has-text('Apply for this job'), "
+                    "a:has-text('Apply'), button:has-text('Apply'), "
+                    "[class*='apply-btn'], [id*='apply-btn'], [aria-label*='Apply']"
+                )
+                if await apply_btn.count() > 0:
+                    try:
+                        await apply_btn.first.click()
+                        await page.wait_for_load_state("domcontentloaded", timeout=15000)
+                        await asyncio.sleep(2)
+                        await wait_for_captcha_if_present(page, source="generic")
+                        print("    ✓ Clicked Apply")
+                    except Exception as e:
+                        print(f"    ✗ Apply click failed: {e}")
+                else:
+                    print("    ℹ No Apply button — attempting to fill visible form")
+
+                # Check if a form is present at all
+                form_count = await page.locator("form").count()
+                if form_count == 0:
+                    print("    ✗ No form found on page")
+                    return "unsupported"
+
+                await _fill_generic_form(page, info, profile_text)
+                print("    ✓ Form filled!")
+
+                if dry_run:
+                    await page.screenshot(path=f"screenshots/generic_dry_{job.get('id', 'unknown')}.png", full_page=True)
+                    print(f"    ✓ DRY RUN — screenshot saved")
+                    return "dry_run"
+                else:
+                    return await _submit_generic(page, job)
+
+            except Exception as e:
+                import traceback
+                print(f"    ✗ Error: {e}")
+                traceback.print_exc()
+                try:
+                    await page.screenshot(path=f"screenshots/generic_error_{job.get('id', 'unknown')}.png")
+                except Exception:
+                    pass
+                return "failed"
+            finally:
+                await asyncio.sleep(2)
+                # cleanup handled by stealth_session
 
 
 async def _fill_generic_form(page, info: dict, profile_text: str):
@@ -224,7 +224,7 @@ async def _fill_generic_form(page, info: dict, profile_text: str):
                 continue
             for r, lbl in options:
                 if answer.lower() in lbl.lower() or lbl.lower() in answer.lower():
-                    await r.evaluate("el => el.click()")
+                    await trusted_click(r)
                     print(f"    ✓ Radio: {lbl}")
                     break
         except Exception as e:
@@ -254,7 +254,7 @@ async def _fill_generic_form(page, info: dict, profile_text: str):
                 if any(w in lbl_lower for w in ("agree", "consent", "confirm", "acknowledge", "accept", "terms", "privacy")):
                     is_checked = await options[0][0].is_checked()
                     if not is_checked:
-                        await options[0][0].evaluate("el => el.click()")
+                        await trusted_click(options[0][0])
                         print(f"    ✓ Checked consent: {options[0][1][:50]}")
                 continue
 
@@ -274,7 +274,7 @@ async def _fill_generic_form(page, info: dict, profile_text: str):
                 if lbl.lower() in answer_lower or any(
                     w in lbl.lower() for w in answer_lower.split(",") if len(w.strip()) > 2
                 ):
-                    await cb.evaluate("el => el.click()")
+                    await trusted_click(cb)
                     print(f"    ✓ Checked: {lbl}")
         except Exception as e:
             print(f"    ✗ Checkbox error: {e}")
