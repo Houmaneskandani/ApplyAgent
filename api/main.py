@@ -93,12 +93,25 @@ ORIGINS = [
     "https://apply-agent-frontend.vercel.app",
 ] + [o.strip() for o in _extra.split(",") if o.strip()]
 
+# SECURITY: explicit method / header allow-lists. The previous "*" wildcard
+# combined with allow_credentials=True is over-permissive — it lets any
+# origin we allow attempt arbitrary methods (e.g., PATCH for not-yet-existent
+# routes) with arbitrary headers (e.g., X-Forwarded-For spoofing). We only
+# actually use GET/POST/PUT/DELETE + OPTIONS for preflight, and the only
+# headers the frontend sends are Authorization (JWT), Content-Type (JSON or
+# multipart), and the standard fetch/XHR set.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "Accept",
+        "Origin",
+        "X-Requested-With",
+    ],
 )
 
 app.include_router(auth_router,        prefix="/auth",         tags=["auth"])
