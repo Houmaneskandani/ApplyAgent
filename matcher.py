@@ -264,38 +264,41 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
 
     print(f"  Scoring {len(jobs)} jobs for user {user_id}...")
 
-    scored = 0
-    skipped = 0
+    # Concurrency cap — Claude Haiku tier allows roughly 50 RPM with 50k TPM.
+    # 5 concurrent in-flight requests is conservative; tune via env if needed.
+    # The internal retry logic in ai_score_job handles transient 429s.
+    SCORE_CONCURRENCY = int(os.getenv("MATCHER_CONCURRENCY", "5"))
+    yrs_exp = prefs.get("years_experience", "")
+    sem = asyncio.Semaphore(SCORE_CONCURRENCY)
 
-    # Rate limit: ~20 jobs/min keeps us well under 50k tokens/min
-    # Each prompt is ~600-800 tokens input + 5 tokens output
-    DELAY_BETWEEN_CALLS = 3.0  # seconds
+    counters = {"scored": 0, "skipped": 0}
 
-    for job in jobs:
+    async def score_one(job):
         job_dict = dict(job)
         title = job_dict.get("title", "")
-
         # Pre-filter by title — no AI call needed
         if not is_engineering_job(title):
             await upsert_application(user_id, job_dict["id"], 0)
-            skipped += 1
-            continue
-
-        score = await ai_score_job(
-            job_dict, profile_summary,
-            years_experience=prefs.get("years_experience", ""),
-        )
+            counters["skipped"] += 1
+            return
+        async with sem:
+            score = await ai_score_job(job_dict, profile_summary, years_experience=yrs_exp)
         await upsert_application(user_id, job_dict["id"], score)
-        scored += 1
-
+        counters["scored"] += 1
         if score >= 7:
             print(f"  [{score}/10] ✓ {title} @ {job_dict.get('company', '')}")
         elif score <= 3:
             print(f"  [{score}/10] ✗ {title} @ {job_dict.get('company', '')}")
 
-        await asyncio.sleep(DELAY_BETWEEN_CALLS)
+    # Run all scoring tasks concurrently. asyncio.gather preserves order on
+    # return but we don't care — each task writes to the DB independently.
+    # return_exceptions=True so one failed score doesn't drop the rest.
+    results = await asyncio.gather(*(score_one(j) for j in jobs), return_exceptions=True)
+    errors = [r for r in results if isinstance(r, Exception)]
+    if errors:
+        print(f"  ⚠ {len(errors)} scoring errors (logged above)")
 
-    print(f"\n  Done — scored: {scored}  |  skipped (not engineering): {skipped}")
+    print(f"\n  Done — scored: {counters['scored']}  |  skipped (not engineering): {counters['skipped']}")
 
 
 if __name__ == "__main__":
