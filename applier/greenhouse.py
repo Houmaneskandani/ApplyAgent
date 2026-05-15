@@ -279,16 +279,32 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com")
             mail.login(imap_user, imap_pass)
-            mail.select('"[Gmail]/All Mail"')
+            # Try All Mail first (catches Spam/Promotions), fall back to INBOX
+            # if the user's Gmail has a different folder naming.
+            select_result, _ = mail.select('"[Gmail]/All Mail"', readonly=False)
+            if select_result != "OK":
+                print(f"    ⚠ Could not select [Gmail]/All Mail, falling back to INBOX")
+                mail.select("INBOX")
 
             since_str = since_dt.strftime("%d-%b-%Y")
             seen_nums = set()
-            # Greenhouse actually sends verification emails from *@greenhouse-mail.io
-            # (NOT @greenhouse.io). Our old filter was missing those entirely.
-            # Also broaden subject matches — verification subjects vary across
-            # Greenhouse versions and per-company customizations.
+            # First tick only: log how many emails are in the mailbox total
+            # (sanity check for "is IMAP even seeing my mail").
+            if elapsed == 5:
+                try:
+                    _, all_msgs = mail.search(None, "ALL")
+                    print(f"    🔎 IMAP sees {len(all_msgs[0].split()) if all_msgs[0] else 0} emails in [Gmail]/All Mail")
+                    # Also sanity-check the most recent ~3 emails to see what's there
+                    if all_msgs[0]:
+                        recent = all_msgs[0].split()[-3:]
+                        for n in reversed(recent):
+                            _, hd = mail.fetch(n, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+                            print(f"    🔎 Recent: {hd[0][1].decode(errors='ignore')[:200]}")
+                except Exception as _e:
+                    print(f"    ⚠ IMAP sanity check failed: {_e}")
+
             for search in [
-                f'(FROM "greenhouse-mail.io" SINCE "{since_str}")',  # the actual sender domain
+                f'(FROM "greenhouse-mail.io" SINCE "{since_str}")',  # actual sender domain
                 f'(FROM "greenhouse.io" SINCE "{since_str}")',
                 f'(FROM "no-reply@greenhouse.io" SINCE "{since_str}")',
                 f'(SUBJECT "verify your application" SINCE "{since_str}")',
@@ -296,10 +312,14 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
                 f'(SUBJECT "verify your email" SINCE "{since_str}")',
                 f'(SUBJECT "code" SINCE "{since_str}")',
                 f'(SUBJECT "Greenhouse" SINCE "{since_str}")',
-                # Last-resort net: any unread email in the polling window
+                f'(SUBJECT "Application")',  # no SINCE — catches edge cases
+                # Last-resort: any unread email in the polling window
                 f'(UNSEEN SINCE "{since_str}")',
             ]:
                 _, msgs = mail.search(None, search)
+                hit_count = len(msgs[0].split()) if msgs[0] else 0
+                if hit_count > 0:
+                    print(f"    🔎 {search} → {hit_count} matches")
                 if not msgs[0]:
                     continue
                 for num in reversed(msgs[0].split()[-10:]):
