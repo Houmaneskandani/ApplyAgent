@@ -1015,15 +1015,47 @@ async def fill_react_select(frame, field_id: str, value: str = None, label: str 
             print(f"    - No options found for {field_id}")
             return False
 
-        # If a batch answer was provided, try to match it directly before calling AI
+        # If a batch answer was provided, try to match it directly before calling AI.
+        #
+        # IMPORTANT: the old logic just did `val_lower in text.lower()` which is
+        # a naive substring match — that meant "male" matched "FEmale" because
+        # "male" is a substring of "female". Same bug for "man" → "woman".
+        # Three-tier match instead:
+        #   1. Exact case-insensitive match across all options       (best)
+        #   2. Word-boundary match (val appears as a whole word)     (good)
+        #   3. Fall through to letting Claude pick                   (fallback)
         ai_choice = ""
         if value:
             val_lower = value.strip().lower()
+
+            # Tier 1: exact match
             for text in option_texts:
-                if text.lower() == val_lower or val_lower in text.lower() or text.lower() in val_lower:
+                if text.lower() == val_lower:
                     ai_choice = text
-                    print(f"    ✓ Batch match: {text!r}")
+                    print(f"    ✓ Batch match (exact): {text!r}")
                     break
+
+            # Tier 2: word-boundary match — "male" matches "Male" inside
+            # "Yes, male" but NOT inside "female" (which has 'fe' attached).
+            if not ai_choice:
+                import re as _re
+                pattern = _re.compile(rf"\b{_re.escape(val_lower)}\b", _re.IGNORECASE)
+                for text in option_texts:
+                    if pattern.search(text):
+                        ai_choice = text
+                        print(f"    ✓ Batch match (word): {text!r}")
+                        break
+
+            # Tier 3 (super-permissive): only if val itself is long enough
+            # that a substring match is unlikely to overlap. >= 6 chars
+            # avoids the "male"/"female" confusion while still catching
+            # "United States" matching "United States of America" etc.
+            if not ai_choice and len(val_lower) >= 6:
+                for text in option_texts:
+                    if val_lower in text.lower() or text.lower() in val_lower:
+                        ai_choice = text
+                        print(f"    ✓ Batch match (substring): {text!r}")
+                        break
 
         if not ai_choice:
             print(f"    ? AI choosing from: {option_texts}")
