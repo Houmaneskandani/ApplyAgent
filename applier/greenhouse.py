@@ -279,12 +279,16 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
         try:
             mail = imaplib.IMAP4_SSL("imap.gmail.com")
             mail.login(imap_user, imap_pass)
-            # Try All Mail first (catches Spam/Promotions), fall back to INBOX
-            # if the user's Gmail has a different folder naming.
-            select_result, _ = mail.select('"[Gmail]/All Mail"', readonly=False)
+            # INBOX first — verification emails should always be there because
+            # they're transactional. Also some accounts have "Show in IMAP"
+            # disabled for the All Mail label, which makes a folder select
+            # silently succeed but searches return nothing.
+            # If INBOX gives no hits later, the search falls through to
+            # All Mail as a wider net (Promotions/Updates/Spam).
+            select_result, _ = mail.select("INBOX", readonly=False)
             if select_result != "OK":
-                print(f"    ⚠ Could not select [Gmail]/All Mail, falling back to INBOX")
-                mail.select("INBOX")
+                print(f"    ⚠ Could not select INBOX, falling back to All Mail")
+                mail.select('"[Gmail]/All Mail"')
 
             since_str = since_dt.strftime("%d-%b-%Y")
             seen_nums = set()
@@ -293,8 +297,7 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
             if elapsed == 5:
                 try:
                     _, all_msgs = mail.search(None, "ALL")
-                    print(f"    🔎 IMAP sees {len(all_msgs[0].split()) if all_msgs[0] else 0} emails in [Gmail]/All Mail")
-                    # Also sanity-check the most recent ~3 emails to see what's there
+                    print(f"    🔎 IMAP sees {len(all_msgs[0].split()) if all_msgs[0] else 0} emails in current folder")
                     if all_msgs[0]:
                         recent = all_msgs[0].split()[-3:]
                         for n in reversed(recent):
@@ -303,16 +306,33 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
                 except Exception as _e:
                     print(f"    ⚠ IMAP sanity check failed: {_e}")
 
-            for search in [
-                f'(FROM "greenhouse-mail.io" SINCE "{since_str}")',  # actual sender domain
+            # Aggressive search list. Real-world Greenhouse verification email
+            # subject we observed: "Security code for your application to Ripple".
+            # So we now match:
+            #   - "security code" (the exact phrase)
+            #   - "security" (broad — catches variants)
+            #   - "code" (most generic)
+            #   - "your application" / "application to" (lots of variants)
+            # Plus company name in subject if provided.
+            company_search = []
+            if company:
+                # Plain "ripple" string matches "Security code for your application to Ripple"
+                company_search.append(f'(SUBJECT "{company}" SINCE "{since_str}")')
+            for search in company_search + [
+                f'(FROM "greenhouse-mail.io" SINCE "{since_str}")',
                 f'(FROM "greenhouse.io" SINCE "{since_str}")',
                 f'(FROM "no-reply@greenhouse.io" SINCE "{since_str}")',
+                f'(SUBJECT "security code" SINCE "{since_str}")',
+                f'(SUBJECT "security" SINCE "{since_str}")',
                 f'(SUBJECT "verify your application" SINCE "{since_str}")',
                 f'(SUBJECT "verification" SINCE "{since_str}")',
                 f'(SUBJECT "verify your email" SINCE "{since_str}")',
+                f'(SUBJECT "your application" SINCE "{since_str}")',
                 f'(SUBJECT "code" SINCE "{since_str}")',
                 f'(SUBJECT "Greenhouse" SINCE "{since_str}")',
-                f'(SUBJECT "Application")',  # no SINCE — catches edge cases
+                # No-SINCE escape hatches — IMAP date drift insurance
+                f'(SUBJECT "security code")',
+                f'(SUBJECT "Application")',
                 # Last-resort: any unread email in the polling window
                 f'(UNSEEN SINCE "{since_str}")',
             ]:
