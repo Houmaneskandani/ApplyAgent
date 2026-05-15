@@ -323,6 +323,7 @@ async def run_pre_submit_review(
     company: str = "",
     job_title: str = "",
     screenshot_prefix: str = "reviewer_blocked",
+    page_for_screenshot=None,
 ) -> bool:
     """
     The full pre-submit reviewer gate as one call. Encapsulates the pattern
@@ -343,6 +344,13 @@ async def run_pre_submit_review(
     logs. Reviewer reliability shouldn't gate user submissions.
     """
     import time as _time
+    # FORCE-SUBMIT BYPASS: when the user clicks "Submit anyway" on a
+    # reviewer-blocked apply, apply.py threads a `_force_submit` flag
+    # through user_info. Honor it: skip the audit entirely and let the
+    # apply proceed. The user has accepted the risk.
+    if user_info and user_info.get("_force_submit"):
+        print("    🔓 Reviewer skipped — user chose 'Submit anyway' (force-submit)")
+        return False
     try:
         print("    🔍 Reviewer auditing filled form before submit...")
         filled = await extract_filled_form_values(page_or_frame)
@@ -377,11 +385,16 @@ async def run_pre_submit_review(
             notes = format_issues_for_notes(verdict)
             if user_info is not None:
                 user_info["_reviewer_notes"] = f"Reviewer blocked: {notes}"
-            # Best-effort screenshot. Page has .screenshot(); Frame doesn't
-            # (skip silently in that case).
+            # Best-effort screenshot. Playwright Frames don't have a direct
+            # .screenshot() — only Pages do. When the caller passed a Frame
+            # (e.g. Greenhouse, where the form lives in an iframe), they
+            # should also pass the parent `page_for_screenshot` so we can
+            # still capture an image. Falls back to `page_or_frame` for
+            # callers that pass a Page directly.
+            screenshot_target = page_for_screenshot or page_or_frame
             try:
-                if hasattr(page_or_frame, "screenshot"):
-                    await page_or_frame.screenshot(
+                if hasattr(screenshot_target, "screenshot"):
+                    await screenshot_target.screenshot(
                         path=f"screenshots/{screenshot_prefix}_{int(_time.time())}.png"
                     )
             except Exception:
