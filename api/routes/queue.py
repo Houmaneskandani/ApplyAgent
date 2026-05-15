@@ -2,9 +2,15 @@ import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 from api.auth import get_current_user
 from db import get_pool
+from applier.browser_utils import throttle_for_url
 
 router = APIRouter()
 
+# NOTE: this lock map is PROCESS-LOCAL. With a single uvicorn worker (Railway
+# default) it serializes a user's queue correctly. If you scale to multiple
+# workers, two processes can both grab the same 'queued' row and run it twice.
+# The recommended hardening is a DB-level claim using SELECT ... FOR UPDATE
+# SKIP LOCKED — that's a separate change tracked as a P1 follow-up.
 _user_locks: dict[int, asyncio.Lock] = {}
 
 # Max seconds a single application can run before being force-killed
@@ -61,10 +67,16 @@ async def process_user_queue(user_id: int):
                 "description": row["description"],
             }
             try:
-                await asyncio.wait_for(
-                    run_application(job_dict, user_id, bool(row["dry_run"])),
-                    timeout=APPLICATION_TIMEOUT,
-                )
+                # Per-domain throttle: no more than MAX_CONCURRENT_PER_DOMAIN (2)
+                # in-flight applications to the same ATS host, with a 15-60s jitter
+                # cooldown before the next one in the queue can grab the slot.
+                # This is the single biggest behavioral change that drops the
+                # "20 applies from one IP in 5 minutes" bot signature.
+                async with throttle_for_url(row["url"]):
+                    await asyncio.wait_for(
+                        run_application(job_dict, user_id, bool(row["dry_run"])),
+                        timeout=APPLICATION_TIMEOUT,
+                    )
             except asyncio.TimeoutError:
                 print(f"  ✗ Application timed out after {APPLICATION_TIMEOUT}s for job {row['job_id']}")
                 pool = await get_pool()

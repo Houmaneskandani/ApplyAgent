@@ -217,6 +217,7 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         # short-lived in-memory dict that the applier consumes.
         from secrets_crypto import decrypt as _decrypt
         user_info = {
+            "user_id": user_id,  # needed for per-user storage_state persistence
             "first_name": name_parts[0],
             "last_name": name_parts[1] if len(name_parts) > 1 else "",
             "email": user["email"],

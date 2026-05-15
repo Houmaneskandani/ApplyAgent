@@ -6,7 +6,7 @@ import asyncio
 import os
 from playwright.async_api import async_playwright
 from applier.greenhouse import get_answer
-from applier.browser_utils import new_stealth_page, wait_for_captcha_if_present
+from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 os.makedirs("screenshots", exist_ok=True)
 
@@ -19,42 +19,43 @@ async def apply_ashby(job: dict, dry_run: bool = True, user_info: dict = None, p
     print(f"\n  Applying to: {job['title']} @ {job['company']}")
     print(f"  URL: {job['url']}")
 
+    # Ashby application page is always at /application suffix
+    target_url = job["url"].rstrip("/")
+    if "/application" not in target_url:
+        target_url = target_url + "/application"
+
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await new_stealth_page(browser)
-
-        try:
-            # Ashby application page is always at /application suffix
-            url = job["url"].rstrip("/")
-            if "/application" not in url:
-                url = url + "/application"
-            print(f"    → Loading: {url}")
-            await page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await wait_for_captcha_if_present(page, source="ashby")
-
-            await _fill_ashby_form(page, info, profile_text)
-            print("    ✓ Form filled!")
-
-            if dry_run:
-                await page.screenshot(path=f"screenshots/ashby_dry_{job.get('id', 'unknown')}.png", full_page=True)
-                print(f"    ✓ DRY RUN — screenshot saved")
-                return "dry_run"
-            else:
-                return await _submit_ashby(page, job)
-
-        except Exception as e:
-            import traceback
-            print(f"    ✗ Error: {e}")
-            traceback.print_exc()
+        async with stealth_session(
+            p, url=target_url, user_id=info.get("user_id"),
+        ) as (_browser, _context, page):
             try:
-                await page.screenshot(path=f"screenshots/ashby_error_{job.get('id', 'unknown')}.png")
-            except Exception:
-                pass
-            return "failed"
-        finally:
-            await asyncio.sleep(2)
-            await browser.close()
+                print(f"    → Loading: {target_url}")
+                await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await wait_for_captcha_if_present(page, source="ashby")
+
+                await _fill_ashby_form(page, info, profile_text)
+                print("    ✓ Form filled!")
+
+                if dry_run:
+                    await page.screenshot(path=f"screenshots/ashby_dry_{job.get('id', 'unknown')}.png", full_page=True)
+                    print(f"    ✓ DRY RUN — screenshot saved")
+                    return "dry_run"
+                else:
+                    return await _submit_ashby(page, job)
+
+            except Exception as e:
+                import traceback
+                print(f"    ✗ Error: {e}")
+                traceback.print_exc()
+                try:
+                    await page.screenshot(path=f"screenshots/ashby_error_{job.get('id', 'unknown')}.png")
+                except Exception:
+                    pass
+                return "failed"
+            finally:
+                await asyncio.sleep(2)
+                # cleanup handled by stealth_session
 
 
 async def _fill_ashby_form(page, info: dict, profile_text: str):

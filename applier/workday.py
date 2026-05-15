@@ -8,7 +8,7 @@ import asyncio
 import os
 from playwright.async_api import async_playwright
 from applier.greenhouse import get_answer
-from applier.browser_utils import new_stealth_page, wait_for_captcha_if_present
+from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 os.makedirs("screenshots", exist_ok=True)
 
@@ -25,65 +25,65 @@ async def apply_workday(job: dict, dry_run: bool = True, user_info: dict = None,
     print(f"  URL: {job['url']}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await new_stealth_page(browser)
-
-        try:
-            print(f"    → Loading: {job['url']}")
-            await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(3)
-            await wait_for_captcha_if_present(page, source="workday")
-
-            # Click Apply button
-            apply_btn = page.locator(
-                "a:has-text('Apply'), button:has-text('Apply'), "
-                "[data-automation-id='applyButton'], "
-                "[aria-label*='Apply']"
-            )
-            if await apply_btn.count() > 0:
-                await apply_btn.first.click()
-                await page.wait_for_load_state("domcontentloaded", timeout=20000)
+        async with stealth_session(
+            p, url=job["url"], user_id=info.get("user_id"),
+        ) as (_browser, _context, page):
+            try:
+                print(f"    → Loading: {job['url']}")
+                await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
                 await asyncio.sleep(3)
-                print("    ✓ Clicked Apply")
-            else:
-                print("    ℹ No Apply button — may be directly on form")
+                await wait_for_captcha_if_present(page, source="workday")
 
-            await wait_for_captcha_if_present(page, source="workday")
+                # Click Apply button
+                apply_btn = page.locator(
+                    "a:has-text('Apply'), button:has-text('Apply'), "
+                    "[data-automation-id='applyButton'], "
+                    "[aria-label*='Apply']"
+                )
+                if await apply_btn.count() > 0:
+                    await apply_btn.first.click()
+                    await page.wait_for_load_state("domcontentloaded", timeout=20000)
+                    await asyncio.sleep(3)
+                    print("    ✓ Clicked Apply")
+                else:
+                    print("    ℹ No Apply button — may be directly on form")
 
-            # Workday sometimes asks to create account or sign in — try "Apply Manually" / guest
-            for guest_sel in [
-                "a:has-text('Apply Manually')",
-                "button:has-text('Apply Manually')",
-                "a:has-text('Apply without an account')",
-                "a:has-text('Continue as Guest')",
-                "button:has-text('Continue as guest')",
-            ]:
+                await wait_for_captcha_if_present(page, source="workday")
+
+                # Workday sometimes asks to create account or sign in — try "Apply Manually" / guest
+                for guest_sel in [
+                    "a:has-text('Apply Manually')",
+                    "button:has-text('Apply Manually')",
+                    "a:has-text('Apply without an account')",
+                    "a:has-text('Continue as Guest')",
+                    "button:has-text('Continue as guest')",
+                ]:
+                    try:
+                        el = page.locator(guest_sel)
+                        if await el.count() > 0 and await el.first.is_visible():
+                            await el.first.click()
+                            await asyncio.sleep(2)
+                            print(f"    ✓ Bypassed login: {guest_sel}")
+                            break
+                    except Exception:
+                        pass
+
+                # Walk through the multi-step wizard
+                result = await _walk_workday_wizard(page, info, profile_text, dry_run, job)
+                return result
+
+            except Exception as e:
+                import traceback
+                print(f"    ✗ Error: {e}")
+                traceback.print_exc()
                 try:
-                    el = page.locator(guest_sel)
-                    if await el.count() > 0 and await el.first.is_visible():
-                        await el.first.click()
-                        await asyncio.sleep(2)
-                        print(f"    ✓ Bypassed login: {guest_sel}")
-                        break
+                    await page.screenshot(path=f"screenshots/workday_error_{job.get('id', 'unknown')}.png")
                 except Exception:
                     pass
-
-            # Walk through the multi-step wizard
-            result = await _walk_workday_wizard(page, info, profile_text, dry_run, job)
-            return result
-
-        except Exception as e:
-            import traceback
-            print(f"    ✗ Error: {e}")
-            traceback.print_exc()
-            try:
-                await page.screenshot(path=f"screenshots/workday_error_{job.get('id', 'unknown')}.png")
-            except Exception:
-                pass
-            return "failed"
-        finally:
-            await asyncio.sleep(2)
-            await browser.close()
+                return "failed"
+            finally:
+                await asyncio.sleep(2)
+                # cleanup handled by stealth_session
 
 
 async def _walk_workday_wizard(page, info: dict, profile_text: str, dry_run: bool, job: dict) -> str:
@@ -320,7 +320,7 @@ async def _fill_workday_generic_questions(page, info: dict, profile_text: str):
                 continue
             for r, lbl in options:
                 if answer.lower() in lbl.lower() or lbl.lower() in answer.lower():
-                    await r.evaluate("el => el.click()")
+                    await trusted_click(r)
                     print(f"    ✓ Radio: {lbl}")
                     break
         except Exception as e:

@@ -3,7 +3,7 @@ import os
 import anthropic
 from playwright.async_api import async_playwright
 from config import ANTHROPIC_API_KEY
-from applier.browser_utils import new_stealth_page, wait_for_captcha_if_present
+from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -329,83 +329,83 @@ async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = No
     print(f"  URL: {job['url']}")
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        page = await new_stealth_page(browser)
-
-        try:
-            os.makedirs("screenshots", exist_ok=True)
-            job_id = job.get('id', 'unknown')
-
-            print(f"    → Loading: {job['url']}")
-            await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
-            await asyncio.sleep(2)
-            await page.screenshot(path=f"screenshots/gh_{job_id}_1_loaded.png")
-            await wait_for_captcha_if_present(page)
-
-            apply_btn = page.locator("a:has-text('Apply'), button:has-text('Apply')")
-            if await apply_btn.count() > 0:
-                await apply_btn.first.click()
-                await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                await asyncio.sleep(2)
-                await wait_for_captcha_if_present(page)
-                await page.screenshot(path=f"screenshots/gh_{job_id}_2_after_apply_click.png")
-                print("    ✓ Clicked Apply on main page")
-            else:
-                print("    ℹ No Apply button, form may already be visible")
-
-            frame = await get_frame(page)
-
-            await fill_by_id(frame, "first_name", info.get("first_name", ""))
-            await fill_by_id(frame, "last_name", info.get("last_name", ""))
-            await fill_by_id(frame, "email", info.get("email", ""))
-            await fill_by_id(frame, "phone", info.get("phone", ""))
-            await fill_location(frame, info.get("location", ""))
-
-            await fill_country(frame, profile)
-
-            resume_input = frame.locator("input#resume[type='file']")
-            if await resume_input.count() > 0:
-                resume_path = info.get("resume_path", "")
-                if resume_path and os.path.exists(resume_path):
-                    await resume_input.set_input_files(resume_path)
-                    print("    ✓ Resume uploaded")
-                    await asyncio.sleep(2)
-                else:
-                    print(f"    ✗ Resume file not found: {resume_path!r}")
-            else:
-                print("    ℹ No resume input found on form")
-
-            cover_letter = frame.locator("#cover_letter_text, textarea[name='cover_letter']")
-            if await cover_letter.count() > 0:
-                cl_text = await get_answer("Write a brief cover letter for this position", "textarea", profile_text=profile)
-                if cl_text:
-                    await cover_letter.first.fill(cl_text)
-                    print("    ✓ Cover letter filled")
-
-            await fill_custom_questions_with_ai(frame, profile)
-
-            await page.screenshot(path=f"screenshots/gh_{job_id}_3_form_filled.png")
-            print(f"    ✓ Form filled! (screenshot: gh_{job_id}_3_form_filled.png)")
-
-            if dry_run:
-                print(f"    ✓ DRY RUN — screenshot saved to screenshots/gh_{job_id}_3_form_filled.png")
-            else:
-                result = await handle_errors_and_retry(frame, page, profile_text=profile, user_info=info, session_start=session_start, company=job.get("company", ""))
-                return result
-
-        except Exception as e:
-            import traceback
-            print(f"    ✗ Error: {e}")
-            traceback.print_exc()
+        async with stealth_session(
+            p, url=job["url"], user_id=info.get("user_id"),
+        ) as (_browser, _context, page):
             try:
-                await page.screenshot(path=f"screenshots/gh_error_{job.get('id', 'unknown')}.png")
-                print(f"    → Screenshot saved: screenshots/gh_error_{job.get('id', 'unknown')}.png")
-            except Exception:
-                pass
-            return "failed"
-        finally:
-            await asyncio.sleep(3)  # pause so you can see the final state
-            await browser.close()
+                os.makedirs("screenshots", exist_ok=True)
+                job_id = job.get('id', 'unknown')
+
+                print(f"    → Loading: {job['url']}")
+                await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                await page.screenshot(path=f"screenshots/gh_{job_id}_1_loaded.png")
+                await wait_for_captcha_if_present(page)
+
+                apply_btn = page.locator("a:has-text('Apply'), button:has-text('Apply')")
+                if await apply_btn.count() > 0:
+                    await apply_btn.first.click()
+                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                    await asyncio.sleep(2)
+                    await wait_for_captcha_if_present(page)
+                    await page.screenshot(path=f"screenshots/gh_{job_id}_2_after_apply_click.png")
+                    print("    ✓ Clicked Apply on main page")
+                else:
+                    print("    ℹ No Apply button, form may already be visible")
+
+                frame = await get_frame(page)
+
+                await fill_by_id(frame, "first_name", info.get("first_name", ""))
+                await fill_by_id(frame, "last_name", info.get("last_name", ""))
+                await fill_by_id(frame, "email", info.get("email", ""))
+                await fill_by_id(frame, "phone", info.get("phone", ""))
+                await fill_location(frame, info.get("location", ""))
+
+                await fill_country(frame, profile)
+
+                resume_input = frame.locator("input#resume[type='file']")
+                if await resume_input.count() > 0:
+                    resume_path = info.get("resume_path", "")
+                    if resume_path and os.path.exists(resume_path):
+                        await resume_input.set_input_files(resume_path)
+                        print("    ✓ Resume uploaded")
+                        await asyncio.sleep(2)
+                    else:
+                        print(f"    ✗ Resume file not found: {resume_path!r}")
+                else:
+                    print("    ℹ No resume input found on form")
+
+                cover_letter = frame.locator("#cover_letter_text, textarea[name='cover_letter']")
+                if await cover_letter.count() > 0:
+                    cl_text = await get_answer("Write a brief cover letter for this position", "textarea", profile_text=profile)
+                    if cl_text:
+                        await cover_letter.first.fill(cl_text)
+                        print("    ✓ Cover letter filled")
+
+                await fill_custom_questions_with_ai(frame, profile)
+
+                await page.screenshot(path=f"screenshots/gh_{job_id}_3_form_filled.png")
+                print(f"    ✓ Form filled! (screenshot: gh_{job_id}_3_form_filled.png)")
+
+                if dry_run:
+                    print(f"    ✓ DRY RUN — screenshot saved to screenshots/gh_{job_id}_3_form_filled.png")
+                else:
+                    result = await handle_errors_and_retry(frame, page, profile_text=profile, user_info=info, session_start=session_start, company=job.get("company", ""))
+                    return result
+
+            except Exception as e:
+                import traceback
+                print(f"    ✗ Error: {e}")
+                traceback.print_exc()
+                try:
+                    await page.screenshot(path=f"screenshots/gh_error_{job.get('id', 'unknown')}.png")
+                    print(f"    → Screenshot saved: screenshots/gh_error_{job.get('id', 'unknown')}.png")
+                except Exception:
+                    pass
+                return "failed"
+            finally:
+                await asyncio.sleep(3)  # pause so you can see the final state
+                # cleanup handled by stealth_session
 
     return "dry_run"
 
@@ -610,7 +610,7 @@ async def handle_errors_and_retry(frame, page, max_retries: int = 5, profile_tex
                 if await submit_btn.count() > 0:
                     btn_text = await submit_btn.first.inner_text()
                     print(f"    → Clicking '{btn_text}' to submit with code...")
-                    await submit_btn.first.evaluate("el => el.click()")
+                    await trusted_click(submit_btn.first)
                 else:
                     print("    → No submit button — pressing Enter on code field")
                     await security.first.press("Enter")
@@ -692,7 +692,7 @@ async def handle_errors_and_retry(frame, page, max_retries: int = 5, profile_tex
                 if await submit_btn.count() > 0:
                     btn_text = await submit_btn.first.inner_text()
                     print(f"    → Clicking '{btn_text}' to submit with code...")
-                    await submit_btn.first.evaluate("el => el.click()")
+                    await trusted_click(submit_btn.first)
                 else:
                     print("    → No submit button — pressing Enter on code field")
                     await security.first.press("Enter")
