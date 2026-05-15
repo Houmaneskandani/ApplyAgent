@@ -435,16 +435,82 @@ async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = No
                 await page.screenshot(path=f"screenshots/gh_{job_id}_1_loaded.png")
                 await wait_for_captcha_if_present(page)
 
-                apply_btn = page.locator("a:has-text('Apply'), button:has-text('Apply')")
-                if await apply_btn.count() > 0:
-                    await apply_btn.first.click()
-                    await page.wait_for_load_state("domcontentloaded", timeout=10000)
-                    await asyncio.sleep(2)
-                    await wait_for_captcha_if_present(page)
-                    await page.screenshot(path=f"screenshots/gh_{job_id}_2_after_apply_click.png")
-                    print("    ✓ Clicked Apply on main page")
-                else:
-                    print("    ℹ No Apply button, form may already be visible")
+                # Find a VISIBLE apply button. The previous selector
+                # `a:has-text('Apply'), button:has-text('Apply')` was too greedy:
+                # on MongoDB's careers page it matched a hidden
+                # `<button id="filter-apply-handler">Apply</button>` (a
+                # search-filter button) before reaching the real apply button.
+                # The new strategy:
+                #   1. Prefer specific phrases ("Apply for this job", "Apply now")
+                #   2. Filter to :visible elements only
+                #   3. Skip known filter-button IDs
+                #   4. If nothing works on the wrapper page, fall back to the
+                #      direct Greenhouse-hosted URL via gh_jid
+                apply_clicked = False
+                for selector in [
+                    "a:has-text('Apply for this job'):visible",
+                    "button:has-text('Apply for this job'):visible",
+                    "a:has-text('Apply now'):visible",
+                    "button:has-text('Apply now'):visible",
+                    "a:has-text('Apply Now'):visible",
+                    "button:has-text('Apply Now'):visible",
+                    # Generic, but visible-only AND excluding known filter ids
+                    "a:has-text('Apply'):visible:not(#filter-apply-handler)",
+                    "button:has-text('Apply'):visible:not(#filter-apply-handler):not([id*='filter']):not([id*='search'])",
+                ]:
+                    btn = page.locator(selector)
+                    try:
+                        count = await btn.count()
+                    except Exception:
+                        continue
+                    if count > 0:
+                        try:
+                            await btn.first.click(timeout=8000)
+                            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+                            await asyncio.sleep(2)
+                            await wait_for_captcha_if_present(page)
+                            await page.screenshot(path=f"screenshots/gh_{job_id}_2_after_apply_click.png")
+                            print(f"    ✓ Clicked Apply on main page (selector: {selector[:50]})")
+                            apply_clicked = True
+                            break
+                        except Exception as e:
+                            print(f"    ⚠ Apply click failed for {selector[:50]}: {type(e).__name__}")
+                            continue
+
+                # Fallback: if we couldn't find a visible apply button on the
+                # company's wrapper careers page, navigate DIRECTLY to the
+                # Greenhouse-hosted form via gh_jid in the URL. This is what
+                # rescues MongoDB, Notion, and other companies that wrap
+                # Greenhouse but don't have a clean Apply button on the wrapper.
+                if not apply_clicked:
+                    import re as _re_jid
+                    m = _re_jid.search(r"gh_jid=(\d+)", job.get("url", ""))
+                    if m:
+                        # Try the standard direct URL formats; one of them
+                        # almost always works.
+                        gh_jid = m.group(1)
+                        company_slug = job.get("company", "").lower().replace(" ", "")
+                        for direct in [
+                            f"https://job-boards.greenhouse.io/{company_slug}/jobs/{gh_jid}",
+                            f"https://boards.greenhouse.io/{company_slug}/jobs/{gh_jid}",
+                            f"https://job-boards.greenhouse.io/embed/job_app?for={company_slug}&token={gh_jid}",
+                        ]:
+                            try:
+                                print(f"    → Wrapper Apply button not found — trying direct URL: {direct[:60]}")
+                                await page.goto(direct, timeout=30000, wait_until="domcontentloaded")
+                                await asyncio.sleep(2)
+                                # Check that we landed on a real Greenhouse form
+                                form_exists = await page.locator("input#first_name, input[name='first_name']").count()
+                                if form_exists > 0:
+                                    print(f"    ✓ Direct URL worked")
+                                    apply_clicked = True
+                                    break
+                            except Exception as e:
+                                print(f"    ⚠ Direct URL failed: {type(e).__name__}")
+                                continue
+
+                if not apply_clicked:
+                    print("    ℹ No Apply button, form may already be visible — trying anyway")
 
                 frame = await get_frame(page)
 
