@@ -215,8 +215,15 @@ async def _set_step(user_id: int, job_id: int, step: str):
                 "UPDATE applications SET notes = $1 WHERE user_id = $2 AND job_id = $3",
                 step, user_id, job_id,
             )
-    except Exception:
-        pass  # never block the main flow
+    except Exception as e:
+        # SECURITY/RELIABILITY: never block the main flow on a status-write
+        # hiccup — but don't silently swallow either. A bare `except: pass`
+        # here hid intermittent DB issues for months. The print() lands in
+        # Railway logs + Sentry (via the LoggingIntegration once we migrate
+        # off print). At minimum the user-facing progress UI stops moving
+        # and we want to know why.
+        print(f"  ⚠ _set_step failed user={user_id} job={job_id} step={step!r}: "
+              f"{type(e).__name__}: {e}")
 
 
 async def run_application(job: dict, user_id: int, dry_run: bool):
@@ -339,7 +346,16 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
 
         try:
             from notifications import notify_application
-            await notify_application(job.get("title", ""), job.get("company", ""), result, user.get("name", ""))
+            # Pass the CANDIDATE's email so the apply-completion email lands
+            # in THEIR inbox, not the operator's. (NOTIFY_EMAIL is still
+            # CC'd for ops monitoring if it's set + different from user.)
+            await notify_application(
+                job.get("title", ""),
+                job.get("company", ""),
+                result,
+                user_name=user.get("name", ""),
+                user_email=user.get("email", ""),
+            )
         except Exception:
             pass
 

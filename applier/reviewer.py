@@ -17,6 +17,7 @@ schools, missed acknowledgment-Yes questions — the exact bugs we kept
 hitting in production today.
 """
 from __future__ import annotations
+import asyncio
 import json
 import anthropic
 from config import ANTHROPIC_API_KEY
@@ -248,46 +249,157 @@ Audit every field. Return JSON only:
   "summary": "1-sentence verdict"
 }}"""
 
+    # RELIABILITY: retry on Anthropic's rate-limit (429) and overload (529)
+    # responses, same shape as matcher.py's scorer. Previously a single
+    # transient 429 → the reviewer returned "warn" and the apply submitted
+    # without an audit. With 3 attempts (20s / 40s / 60s backoff) we ride
+    # out brief capacity blips without blocking the apply flow on a real
+    # outage. Non-retryable errors (JSON parse, schema, etc) still fall
+    # through to "warn" immediately — retrying those would just waste tokens.
+    for attempt in range(3):
+        try:
+            message = await _client.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=1500,
+                system=_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = message.content[0].text.strip()
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = raw.split("```", 2)[1] if "```" in raw[3:] else raw
+                if raw.startswith("json"):
+                    raw = raw[4:].strip()
+                elif raw.startswith("\n"):
+                    raw = raw.strip()
+                # Remove trailing ``` if any leftover
+                raw = raw.rsplit("```", 1)[0].strip()
+            result = json.loads(raw)
+            # Normalize the verdict + ensure required keys exist
+            verdict = result.get("verdict", "warn").lower()
+            if verdict not in ("pass", "warn", "fail"):
+                verdict = "warn"
+            result["verdict"] = verdict
+            result.setdefault("issues", [])
+            result.setdefault("summary", "")
+            return result
+        except json.JSONDecodeError as e:
+            # Parsing failures aren't transient — retrying won't help.
+            print(f"    ⚠ Reviewer returned invalid JSON: {e}")
+            return {
+                "verdict": "warn",
+                "issues": [],
+                "summary": "Reviewer response was unparseable — proceeding without verdict.",
+            }
+        except Exception as e:
+            msg = str(e)
+            is_rate_limited = ("rate_limit" in msg or "429" in msg or "529" in msg)
+            if is_rate_limited and attempt < 2:
+                wait = 20 * (attempt + 1)  # 20s, 40s
+                print(f"    ⏳ Reviewer rate-limited — retrying in {wait}s "
+                      f"(attempt {attempt+1}/3)...")
+                await asyncio.sleep(wait)
+                continue
+            # Either non-retryable or we've exhausted the budget.
+            print(f"    ⚠ Reviewer API call failed: {type(e).__name__}: {e}")
+            return {
+                "verdict": "warn",
+                "issues": [],
+                "summary": "Reviewer unavailable — proceeding without verdict.",
+            }
+    # Defensive: only reachable if we somehow exit the loop without returning.
+    print(f"    ✗ Reviewer gave up after 3 attempts (rate limit)")
+    return {
+        "verdict": "warn",
+        "issues": [],
+        "summary": "Reviewer unavailable — proceeding without verdict.",
+    }
+
+
+async def run_pre_submit_review(
+    page_or_frame,
+    user_info: dict | None,
+    profile_text: str | None,
+    company: str = "",
+    job_title: str = "",
+    screenshot_prefix: str = "reviewer_blocked",
+) -> bool:
+    """
+    The full pre-submit reviewer gate as one call. Encapsulates the pattern
+    that lives inline in applier/greenhouse.py so the 5 other appliers can
+    use it in 3 lines instead of 50.
+
+    Returns:
+        True  → the reviewer BLOCKED submission. The applier should bail
+                out with `return "unknown"`. Notes (formatted issues) are
+                stashed on `user_info["_reviewer_notes"]` so apply.py can
+                surface them in the Needs Review tab.
+        False → proceed with the submit (verdict was pass / warn, no
+                blockers, OR the reviewer itself had an error — in which
+                case we fail OPEN so a flaky reviewer never blocks real
+                applies).
+
+    The helper is best-effort: any exception inside it returns False and
+    logs. Reviewer reliability shouldn't gate user submissions.
+    """
+    import time as _time
     try:
-        message = await _client.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=1500,
-            system=_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
+        print("    🔍 Reviewer auditing filled form before submit...")
+        filled = await extract_filled_form_values(page_or_frame)
+        if not filled:
+            print("    ⚠ Reviewer skipped: no filled fields detected "
+                  "(form may be in iframe we couldn't read)")
+            return False
+
+        print(f"    🔍 Reviewer found {len(filled)} filled fields — "
+              f"sending to Claude...")
+        verdict = await review_form(
+            field_values=filled,
+            profile_text=profile_text or "",
+            company=company or "",
+            job_title=job_title or "",
         )
-        raw = message.content[0].text.strip()
-        # Strip markdown code fences if present
-        if raw.startswith("```"):
-            raw = raw.split("```", 2)[1] if "```" in raw[3:] else raw
-            if raw.startswith("json"):
-                raw = raw[4:].strip()
-            elif raw.startswith("\n"):
-                raw = raw.strip()
-            # Remove trailing ``` if any leftover
-            raw = raw.rsplit("```", 1)[0].strip()
-        result = json.loads(raw)
-        # Normalize the verdict + ensure required keys exist
-        verdict = result.get("verdict", "warn").lower()
-        if verdict not in ("pass", "warn", "fail"):
-            verdict = "warn"
-        result["verdict"] = verdict
-        result.setdefault("issues", [])
-        result.setdefault("summary", "")
-        return result
-    except json.JSONDecodeError as e:
-        print(f"    ⚠ Reviewer returned invalid JSON: {e}")
-        return {
-            "verdict": "warn",
-            "issues": [],
-            "summary": "Reviewer response was unparseable — proceeding without verdict.",
-        }
-    except Exception as e:
-        print(f"    ⚠ Reviewer API call failed: {type(e).__name__}: {e}")
-        return {
-            "verdict": "warn",
-            "issues": [],
-            "summary": "Reviewer unavailable — proceeding without verdict.",
-        }
+        v = verdict.get("verdict", "warn")
+        summary = verdict.get("summary", "")
+        issues = verdict.get("issues", [])
+        blockers = [i for i in issues if i.get("severity") == "blocker"]
+        print(f"    🔍 Reviewer verdict: {v.upper()} — {summary}")
+        for i in issues[:5]:
+            sev = i.get("severity", "")
+            marker = "✗" if sev == "blocker" else "⚠"
+            print(f"      {marker} {(i.get('field') or '?')[:50]}: "
+                  f"entered '{(i.get('entered') or '')[:50]}' "
+                  f"(expected '{(i.get('expected') or '')[:50]}')")
+
+        if v == "fail" and blockers:
+            print(f"    ✗ Reviewer BLOCKED submission "
+                  f"({len(blockers)} blockers) — routing to Needs Review")
+            notes = format_issues_for_notes(verdict)
+            if user_info is not None:
+                user_info["_reviewer_notes"] = f"Reviewer blocked: {notes}"
+            # Best-effort screenshot. Page has .screenshot(); Frame doesn't
+            # (skip silently in that case).
+            try:
+                if hasattr(page_or_frame, "screenshot"):
+                    await page_or_frame.screenshot(
+                        path=f"screenshots/{screenshot_prefix}_{int(_time.time())}.png"
+                    )
+            except Exception:
+                pass
+            return True
+
+        if v == "warn":
+            print(f"    ⚠ Reviewer warnings but proceeding to submit "
+                  f"(warnings, not blockers).")
+        return False
+    except Exception as _e:
+        # Fail OPEN: never block a real apply on a reviewer infrastructure
+        # bug. The user has already paid for tokens via the form-filling
+        # agent; refusing to submit because OUR auditor crashed is worse
+        # than submitting an audited-by-the-form-filler-only application.
+        print(f"    ⚠ Reviewer error (continuing anyway): "
+              f"{type(_e).__name__}: {_e}")
+        return False
 
 
 def format_issues_for_notes(verdict: dict, max_issues: int = 5) -> str:
