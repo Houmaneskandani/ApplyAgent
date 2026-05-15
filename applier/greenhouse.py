@@ -114,6 +114,13 @@ Instructions:
   (hybrid, office, travel, schedule, background check, drug test, equal opportunity, laws/regulations):
   ALWAYS answer "Yes" — the candidate already chose to apply, so they accept the terms.
   NEVER answer "No" for acknowledgment/consent/compliance questions unless profile explicitly says otherwise.
+- For PREVIOUS-EMPLOYER questions ("Do you currently work at X?", "Have you ever worked at X?",
+  "Are you a current or former employee of X?"):
+  Answer "No" UNLESS company X explicitly appears in the candidate's resume or employment history.
+  Saying "Yes" when X is not in the resume is a fabrication that disqualifies the application.
+  Treat the candidate's profile + resume as the ONLY source of truth on past employers.
+- For REFERRAL questions ("Were you referred?", "Do you know anyone who works here?"):
+  Answer "No" unless the profile explicitly names a referrer.
 - For conditional questions like "If you answered Yes above, please describe..." where the relevant
   prior answer was "No": reply with just "N/A". Never write meta-commentary or say you don't have info.
 - For unknown questions with no profile data:
@@ -209,6 +216,20 @@ Examples (recognize ANY of these patterns — they're ALWAYS Yes):
 The candidate already chose to apply, so they accept these terms.
 NEVER answer "No" to an acknowledgment question unless the candidate's
 profile explicitly says they refuse it.
+
+CRITICAL — PREVIOUS-EMPLOYER questions → strict "No" by default:
+Questions that ask "Do you currently work at X?" / "Have you previously
+worked at X?" / "Are you a current or former employee of X?" — answer
+"No" UNLESS the company X explicitly appears in the candidate's resume
+or employment history. Brex/Capital One/Robinhood/etc. asking about
+their competitors is the most common variant; saying "Yes" when you
+didn't actually work there is a serious factual error that disqualifies
+the application. The candidate's profile and resume are the ONLY source
+of truth — if X is not in either, answer "No".
+
+CRITICAL — REFERRAL/CONNECTION questions → strict "No" by default:
+"Were you referred by an employee?" / "Do you know anyone who works
+here?" → "No" unless the profile explicitly names a referrer.
 
 Reply ONLY with valid JSON. No explanation. No markdown. Example:
 {{"1": "Yes", "2": "5 years", "3": "I am authorized to work in the US"}}"""
