@@ -110,6 +110,10 @@ async def get_profile(user=Depends(get_current_user)):
 
 @router.put("/")
 async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+    import time as _t
+    _t0 = _t.perf_counter()
+    user_id = user["user_id"]
+
     # Reject obviously oversized payloads. The /profile/ PUT historically
     # accepted an unbounded dict; a malicious client could send tens of MB.
     name = data.get("name")
@@ -119,24 +123,36 @@ async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Dep
     prefs_in = data.get("preferences") or {}
     if not isinstance(prefs_in, dict):
         raise HTTPException(status_code=400, detail="preferences must be an object")
-    # Hard cap on serialized size of preferences to keep the JSONB column sane.
     try:
         encoded = json.dumps(prefs_in)
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="preferences must be JSON-serializable")
+    print(f"  [PUT /profile/] user={user_id} prefs_size={len(encoded)} bytes name_len={len(name or '')}")
     if len(encoded) > 64 * 1024:  # 64 KB
-        raise HTTPException(status_code=413, detail="preferences too large")
+        print(f"  [PUT /profile/] REJECTED user={user_id}: prefs payload {len(encoded)} > 64KB")
+        raise HTTPException(status_code=413, detail=f"Preferences too large ({len(encoded)} bytes; max 65536)")
 
-    prefs_encrypted = _encrypt_secret_prefs(prefs_in)
+    try:
+        prefs_encrypted = _encrypt_secret_prefs(prefs_in)
+    except Exception as e:
+        print(f"  [PUT /profile/] ENCRYPT FAILED user={user_id}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Encryption error: {type(e).__name__}")
 
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE users SET name = COALESCE($1, name), preferences = $2
-            WHERE id = $3
-        """, name, json.dumps(prefs_encrypted), user["user_id"])
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE users SET name = COALESCE($1, name), preferences = $2
+                WHERE id = $3
+            """, name, json.dumps(prefs_encrypted), user_id)
+    except Exception as e:
+        print(f"  [PUT /profile/] DB UPDATE FAILED user={user_id}: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"DB error: {type(e).__name__}")
+
     # Rescore all jobs in background using the updated profile
-    background_tasks.add_task(score_jobs, user["user_id"], None, True)
+    background_tasks.add_task(score_jobs, user_id, None, True)
+    elapsed_ms = round((_t.perf_counter() - _t0) * 1000, 1)
+    print(f"  [PUT /profile/] OK user={user_id} in {elapsed_ms}ms (rescore queued)")
     return {"status": "updated", "rescoring": True}
 
 
