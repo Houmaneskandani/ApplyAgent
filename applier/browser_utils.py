@@ -544,6 +544,77 @@ async def _inject_arkose_token(page, token: str) -> bool:
         return False
 
 
+async def _extract_recaptcha_sitekey(page, content: str) -> str:
+    """
+    Robust reCAPTCHA sitekey extraction. The OLD implementation only checked
+    one regex (`data-sitekey=6L...`) and quietly returned empty string on
+    miss, sending a malformed task to Capsolver every time. Real-world
+    reCAPTCHA sitekeys appear in 4 different places on the page; we now try
+    all of them in order of reliability.
+
+    Sitekeys are always exactly 40 chars and start with "6" (almost always
+    "6L"; "6c" / "6e" / "6f" exist but are rare).
+    """
+    import re as _re
+
+    # Strategy 1: iframe[src*='recaptcha'] — Google embeds the sitekey as
+    # the `k` query parameter. Most reliable signal because the iframe is
+    # always present when reCAPTCHA is rendered.
+    try:
+        iframes = await page.locator("iframe[src*='recaptcha']").all()
+        for iframe in iframes:
+            src = await iframe.get_attribute("src") or ""
+            m = _re.search(r'[?&]k=([0-9A-Za-z_-]{40})', src)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+
+    # Strategy 2: explicit data-sitekey attributes on common elements
+    for sel in [
+        ".g-recaptcha[data-sitekey]",
+        "[data-sitekey^='6']",
+        "[data-recaptcha-sitekey]",
+        "div[data-sitekey]",
+    ]:
+        try:
+            el = page.locator(sel)
+            if await el.count() > 0:
+                key = (
+                    await el.first.get_attribute("data-sitekey")
+                    or await el.first.get_attribute("data-recaptcha-sitekey")
+                    or ""
+                )
+                if key and len(key) == 40:
+                    return key
+        except Exception:
+            pass
+
+    # Strategy 3: page-source regex for known formats
+    for pat in [
+        r'sitekey["\']?\s*[:=]\s*["\']?(6[A-Za-z0-9_-]{39})',
+        r'data-sitekey\s*=\s*["\']?(6[A-Za-z0-9_-]{39})',
+        r'data-recaptcha-sitekey\s*=\s*["\']?(6[A-Za-z0-9_-]{39})',
+        r'/recaptcha/api\.js\?render=([0-9A-Za-z_-]{40})',  # v3 invisible
+        r'grecaptcha\.execute\(\s*["\']([0-9A-Za-z_-]{40})["\']',  # v3 explicit
+        r'grecaptcha\.render\([^,]+,\s*\{[^}]*sitekey:\s*["\']([0-9A-Za-z_-]{40})',
+    ]:
+        m = _re.search(pat, content)
+        if m:
+            return m.group(1)
+
+    # Strategy 4: last-resort — any `6L...` 40-char string that has
+    # "recaptcha" or "sitekey" within 100 chars of context. This catches
+    # configurations we haven't seen but rejects unrelated 40-char strings.
+    for m in _re.finditer(r'\b(6[LceEf][0-9A-Za-z_-]{38})\b', content):
+        start = max(0, m.start() - 100)
+        ctx = content[start:m.end() + 100].lower()
+        if 'recaptcha' in ctx or 'sitekey' in ctx:
+            return m.group(1)
+
+    return ""
+
+
 async def _detect_captcha_type(page) -> tuple[str, str]:
     """
     Detect CAPTCHA type. Returns (type, sitekey).
@@ -577,8 +648,7 @@ async def _detect_captcha_type(page) -> tuple[str, str]:
 
     # ── Google reCAPTCHA ──────────────────────────────────────
     if "recaptcha" in content.lower() or "google.com/recaptcha" in content:
-        m = _re.search(r'(?:data-sitekey|sitekey)[=:]["\'\s]*(6[A-Za-z0-9_-]{39})', content)
-        key = m.group(1) if m else ""
+        key = await _extract_recaptcha_sitekey(page, content)
         # Detect v3 vs v2 by checking for grecaptcha.execute
         captcha_type = "recaptchav3" if "grecaptcha.execute" in content else "recaptchav2"
         return (captcha_type, key)

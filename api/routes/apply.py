@@ -315,7 +315,12 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
                 job, dry_run=dry_run, user_info=user_info, profile_text=profile_text
             )
 
-        await _set_step(user_id, job_id, f"Done: {result}")
+        # The reviewer-agent in greenhouse.py (and eventually the other
+        # appliers) can stash a detailed "why we blocked" note on user_info
+        # so we can surface it in the Needs Review tab. Prefer that over
+        # the generic "Done: result" message.
+        reviewer_notes = user_info.get("_reviewer_notes") if user_info else None
+        await _set_step(user_id, job_id, reviewer_notes or f"Done: {result}")
 
         # For dry runs: reset status back to 'new' so the job stays in Job Matches
         # For live runs: update to the real result (applied / failed / unsupported)
