@@ -17,3 +17,5 @@ pypdf
 capsolver
 twilio
 stripe
+slowapi          # auth rate-limiting
+cryptography     # Fernet — encrypt IMAP App Passwords at rest

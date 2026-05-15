@@ -257,19 +257,34 @@ async def get_user_credits(user_id: int) -> float:
 
 
 async def deduct_credits(user_id: int, amount: float) -> bool:
-    """Deduct credits. Returns False if balance is insufficient."""
+    """
+    Atomically deduct credits. Returns True on success, False if the user
+    had insufficient balance.
+
+    SECURITY: this MUST be a single conditional UPDATE. A SELECT-then-UPDATE
+    pattern is a textbook TOCTOU race — N concurrent /apply requests for a
+    user with just enough credits can all pass the SELECT, all UPDATE, and
+    leave the user with a negative balance.
+
+    The `credits >= $1` predicate and the RETURNING clause together give us
+    a single atomic check-and-decrement: Postgres takes a row-level lock for
+    the UPDATE; the predicate is evaluated against the locked row; rows that
+    fail the predicate are not updated and RETURNING is empty.
+    """
+    if amount <= 0:
+        return True  # nothing to deduct
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT credits FROM users WHERE id = $1", user_id
-        )
-        if not row or (row["credits"] or 0) < amount:
-            return False
-        await conn.execute(
-            "UPDATE users SET credits = credits - $1 WHERE id = $2",
+            """
+            UPDATE users
+               SET credits = credits - $1
+             WHERE id = $2 AND COALESCE(credits, 0) >= $1
+            RETURNING credits
+            """,
             amount, user_id,
         )
-        return True
+        return row is not None
 
 
 async def add_credits(user_id: int, amount: float):

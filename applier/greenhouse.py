@@ -743,12 +743,19 @@ async def handle_errors_and_retry(frame, page, max_retries: int = 5, profile_tex
         errors = await find_errors(frame)
 
         if not errors:
-            # No errors AND no clear success message — form likely submitted fine.
-            # Treat as applied rather than unknown (Greenhouse sometimes shows no
-            # explicit confirmation inside the iframe).
-            print("    ✓ No validation errors — treating as applied")
-            await page.screenshot(path=f"screenshots/applied_no_confirm_{attempt}.png")
-            return "applied"
+            # No positive confirmation (URL change, success heading, or
+            # confirmation text) AND no visible errors. This is the classic
+            # silent-block case: the page froze mid-submit because of a
+            # CAPTCHA or anti-bot wall that didn't surface a user-visible
+            # error. Mark "unknown" instead of falsely claiming success —
+            # this protects the credit balance and surfaces the case to the
+            # user for manual verification.
+            print("    ⚠ No success confirmation and no errors — outcome unknown")
+            try:
+                await page.screenshot(path=f"screenshots/gh_unknown_{attempt}.png")
+            except Exception:
+                pass
+            return "unknown"
 
         print(f"    Found {len(errors)} error(s):")
         for dbg_id, dbg_msg in errors:

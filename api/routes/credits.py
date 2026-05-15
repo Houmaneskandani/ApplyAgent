@@ -60,25 +60,49 @@ async def create_checkout(package_id: str, user=Depends(get_current_user)):
         )
         return {"checkout_url": session.url}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log full error for ops, return a generic message to the caller so we
+        # don't leak Stripe API key state or internal versions.
+        print(f"  ⚠ Stripe checkout error for user {user['user_id']}: {e}")
+        raise HTTPException(status_code=500, detail="Could not create checkout session")
 
 
 @router.post("/webhook")
 async def stripe_webhook(request: Request):
-    """Stripe calls this after a successful payment to add credits."""
+    """
+    Stripe calls this after a successful payment to add credits.
+
+    SECURITY: signature verification is MANDATORY. Without it, anyone on the
+    internet can POST a fake `checkout.session.completed` event and grant
+    themselves arbitrary credits. If STRIPE_WEBHOOK_SECRET is unset, we refuse
+    to process the request.
+    """
+    if not STRIPE_WEBHOOK_SECRET:
+        # Hard 503 — the service is misconfigured. (Should never reach here
+        # in production because config.validate_config() crashes at startup,
+        # but defense in depth.)
+        raise HTTPException(
+            status_code=503,
+            detail="Stripe webhook is not configured. Set STRIPE_WEBHOOK_SECRET.",
+        )
+
     payload = await request.body()
     sig = request.headers.get("stripe-signature", "")
+    if not sig:
+        raise HTTPException(status_code=400, detail="Missing stripe-signature header")
 
     try:
         import stripe
         stripe.api_key = STRIPE_SECRET_KEY
 
-        if STRIPE_WEBHOOK_SECRET:
-            event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
-        else:
-            import json
-            event = json.loads(payload)
+        # construct_event raises stripe.error.SignatureVerificationError on
+        # bad/missing/expired signatures.
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception:
+        # Do NOT leak the underlying exception message to the caller — it can
+        # confirm whether a webhook secret is correct vs. malformed payload.
+        raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
+    try:
         if event["type"] == "checkout.session.completed":
             session = event["data"]["object"]
             meta = session.get("metadata", {})
@@ -90,4 +114,6 @@ async def stripe_webhook(request: Request):
 
         return {"received": True}
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        # Internal processing error — log but return 500 (Stripe will retry).
+        print(f"  ⚠ Webhook processing error: {e}")
+        raise HTTPException(status_code=500, detail="Webhook processing failed")

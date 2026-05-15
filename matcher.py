@@ -61,14 +61,6 @@ def extract_text_from_pdf(path: str) -> str:
         return ""
 
 
-def load_local_resume() -> str:
-    """Try to load resume.pdf from the job-bot directory."""
-    path = os.path.join(os.path.dirname(__file__), "resume.pdf")
-    if os.path.exists(path):
-        return extract_text_from_pdf(path)
-    return ""
-
-
 async def download_resume_from_url(resume_url: str) -> str:
     """Download resume from Supabase Storage and extract text."""
     try:
@@ -143,11 +135,37 @@ Languages: {', '.join(l if isinstance(l, str) else l.get('name','') for l in lan
 
 # ── AI scoring ─────────────────────────────────────────────────────────────
 
-async def ai_score_job(job: dict, profile_summary: str) -> int:
+async def ai_score_job(job: dict, profile_summary: str, years_experience: str = "") -> int:
     """Use Claude Haiku to score job-resume fit 0-10."""
     title = job.get("title", "Unknown")
     company = job.get("company", "Unknown")
     description = (job.get("description", "") or "")[:2000]
+
+    # Build seniority guidance from the candidate's actual years of experience
+    # instead of hardcoding "4 years" — that was leaking the operator's profile
+    # into every other user's scoring.
+    try:
+        yrs = int(str(years_experience).strip() or "0")
+    except (TypeError, ValueError):
+        yrs = 0
+    if yrs >= 12:
+        seniority_note = (
+            f"- The candidate has ~{yrs} years experience. Staff/Principal/Director roles are appropriate."
+        )
+    elif yrs >= 7:
+        seniority_note = (
+            f"- The candidate has ~{yrs} years experience. Senior/Lead roles fit; Staff/Principal stretch."
+        )
+    elif yrs >= 3:
+        seniority_note = (
+            f"- The candidate has ~{yrs} years experience. Mid/Senior fits; Staff/Principal/Distinguished too senior (-2)."
+        )
+    elif yrs >= 1:
+        seniority_note = (
+            f"- The candidate has ~{yrs} years experience. Mid/Junior fits; Senior+ likely too senior (-2)."
+        )
+    else:
+        seniority_note = "- Seniority unknown — judge fit from the rest of the profile/resume only."
 
     prompt = f"""Rate how well this job matches this candidate. Reply with ONE integer 0-10.
 
@@ -165,9 +183,10 @@ Scoring rules:
 3-4  = Weak — different tech stack or off-target seniority
 0-2  = Poor — wrong domain entirely
 
+Seniority guidance:
+{seniority_note}
+
 Penalize (-2) if:
-- Job requires 8+ years but candidate has ~4 years
-- Job title is "Staff", "Principal", "Distinguished", or "Fellow" (too senior for 4yrs exp)
 - Job is pure frontend (HTML/CSS/React only) but candidate is a backend engineer
 - Job requires security clearance but candidate has none
 - Job explicitly requires on-site and candidate prefers remote (or vice versa)
@@ -191,11 +210,16 @@ Reply with ONLY a single integer (0-10). Nothing else."""
                 messages=[{"role": "user", "content": prompt}],
             )
             raw = message.content[0].text.strip()
-            match = re.search(r"\d+", raw)
-            return max(0, min(int(match.group()), 10)) if match else 5
+            # \b\d+\b matches whole numbers — prevents "15" from being parsed as "1"
+            # (the previous \d+ would grab the first single digit).
+            match = re.search(r"\b\d+\b", raw)
+            if not match:
+                print(f"    ⚠ Could not parse score from response: {raw!r}")
+                return 5
+            return max(0, min(int(match.group()), 10))
         except Exception as e:
             msg = str(e)
-            if "rate_limit" in msg or "529" in msg or "529" in msg:
+            if "rate_limit" in msg or "429" in msg or "529" in msg:
                 wait = 60 * (attempt + 1)
                 print(f"    ⏳ Rate limited — waiting {wait}s (attempt {attempt+1}/4)...")
                 await asyncio.sleep(wait)
@@ -225,18 +249,16 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     prefs = prefs_raw or {}
     resume_url = row["resume_url"] if row else None
 
-    # Get resume text — prefer DB resume, fall back to local file
+    # Per-user resume only. NEVER fall back to a committed local resume.pdf —
+    # that would score one user's jobs against another user's resume, which is
+    # a real multi-tenant correctness bug.
     resume_text = ""
     if resume_url:
         resume_text = await download_resume_from_url(resume_url)
         if resume_text:
             print(f"  ✓ Resume downloaded from storage ({len(resume_text)} chars)")
     if not resume_text:
-        resume_text = load_local_resume()
-        if resume_text:
-            print(f"  ✓ Local resume.pdf loaded ({len(resume_text)} chars)")
-        else:
-            print("  ⚠ No resume found — AI will use profile info only")
+        print(f"  ⚠ User {user_id} has no resume — AI will use profile info only")
 
     profile_summary = build_profile_summary(prefs, user, resume_text)
 
@@ -259,7 +281,10 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
             skipped += 1
             continue
 
-        score = await ai_score_job(job_dict, profile_summary)
+        score = await ai_score_job(
+            job_dict, profile_summary,
+            years_experience=prefs.get("years_experience", ""),
+        )
         await upsert_application(user_id, job_dict["id"], score)
         scored += 1
 

@@ -213,6 +213,9 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
             prefs.get("zip", ""),
         ])).strip() or prefs.get("country", "United States")
 
+        # SECURITY: imap_pass is encrypted at rest. Decrypt only inside this
+        # short-lived in-memory dict that the applier consumes.
+        from secrets_crypto import decrypt as _decrypt
         user_info = {
             "first_name": name_parts[0],
             "last_name": name_parts[1] if len(name_parts) > 1 else "",
@@ -225,7 +228,7 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
             "website": prefs.get("portfolio", ""),
             "salary": f"{prefs.get('salary_min', '')}-{prefs.get('salary_max', '')}".strip("-") or "Open to discuss",
             "imap_user": prefs.get("imap_user", ""),
-            "imap_pass": prefs.get("imap_pass", ""),
+            "imap_pass": _decrypt(prefs.get("imap_pass", "")),
         }
 
         await _set_step(user_id, job_id, "Reading resume...")
@@ -337,13 +340,25 @@ async def apply_to_job(
                     detail=f"Not enough credits ({credits:.1f} remaining). Please purchase more credits."
                 )
 
-        # Prevent re-queuing a job that's already being applied or was applied
+        # Prevent re-queuing a job that's already being applied or was applied.
+        # Previously this only blocked "applying" — meaning a user could apply
+        # twice to the same role and be billed twice. Now we also block:
+        #  - "applied"  : already submitted successfully
+        #  - "queued"   : waiting in the queue (double-queue would skip the lock)
+        # We deliberately ALLOW retry on "failed" and "unknown" so users can
+        # retry a bot-blocked submission.
         existing = await conn.fetchrow(
             "SELECT status FROM applications WHERE user_id = $1 AND job_id = $2",
             user_id, job_id
         )
-        if existing and existing["status"] in ("applying",):
-            raise HTTPException(status_code=400, detail="This job is currently being applied")
+        if existing:
+            status = existing["status"]
+            if status == "applying":
+                raise HTTPException(status_code=409, detail="This job is currently being applied")
+            if status == "applied" and not dry_run:
+                raise HTTPException(status_code=409, detail="You already applied to this job")
+            if status == "queued":
+                raise HTTPException(status_code=409, detail="This job is already in your queue")
 
     from db import add_to_queue
     position = await add_to_queue(user_id, job_id, dry_run)
