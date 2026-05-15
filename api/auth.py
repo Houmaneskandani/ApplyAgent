@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from passlib.context import CryptContext
@@ -6,15 +6,50 @@ from jose import jwt, JWTError
 from datetime import datetime, timedelta
 from db import get_pool
 import os
-import random
+import secrets as _secrets
+
+# SECURITY: rate-limit auth endpoints. Without these limits, a 6-digit reset
+# code (~1M space) is brute-forceable in ~17 minutes within its 15-min window,
+# and there's no defense against credential stuffing on /login.
+try:
+    from slowapi import Limiter
+    from slowapi.util import get_remote_address
+    limiter = Limiter(key_func=get_remote_address)
+    _HAS_LIMITER = True
+except ImportError:
+    limiter = None
+    _HAS_LIMITER = False
+
+
+def _rate_limit(rule: str):
+    """Decorator that applies a rate limit if slowapi is installed, else no-ops."""
+    def deco(fn):
+        return limiter.limit(rule)(fn) if _HAS_LIMITER else fn
+    return deco
+
 
 router = APIRouter()
 security = HTTPBearer()
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this")
+# SECURITY: SECRET_KEY is REQUIRED. No fallback default — a missing or default
+# secret means every JWT in the world is forgeable. Fail loud at import time.
+SECRET_KEY = os.getenv("SECRET_KEY")
+_INSECURE_DEFAULTS = {"", "your-secret-key-change-this", "change-me", "secret"}
+if not SECRET_KEY or SECRET_KEY in _INSECURE_DEFAULTS:
+    raise RuntimeError(
+        "SECRET_KEY environment variable is required and must be a strong random value.\n"
+        "Generate one with:  python -c \"import secrets; print(secrets.token_urlsafe(64))\"\n"
+        "Then set it in your environment (Railway → Variables, or local .env)."
+    )
+if len(SECRET_KEY) < 32:
+    raise RuntimeError(
+        f"SECRET_KEY is only {len(SECRET_KEY)} chars; require at least 32 for HS256 safety."
+    )
+
 ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 24 * 7
+BCRYPT_MAX_BYTES = 72  # bcrypt truncates beyond this; apply the SAME truncation everywhere
 
 class SignupRequest(BaseModel):
     email: str
@@ -41,13 +76,14 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         raise HTTPException(status_code=401, detail="Invalid token")
 
 @router.post("/signup")
-async def signup(req: SignupRequest):
+@_rate_limit("5/minute")
+async def signup(request: Request, req: SignupRequest):
     pool = await get_pool()
     async with pool.acquire() as conn:
         existing = await conn.fetchrow("SELECT id FROM users WHERE email = $1", req.email)
         if existing:
             raise HTTPException(status_code=400, detail="Email already registered")
-        hashed = pwd_context.hash(req.password[:72])
+        hashed = pwd_context.hash(req.password[:BCRYPT_MAX_BYTES])
         row = await conn.fetchrow("""
             INSERT INTO users (email, name, password_hash)
             VALUES ($1, $2, $3) RETURNING id
@@ -56,7 +92,8 @@ async def signup(req: SignupRequest):
         return {"token": token, "user_id": row["id"], "name": req.name}
 
 @router.post("/login")
-async def login(req: LoginRequest):
+@_rate_limit("10/minute")
+async def login(request: Request, req: LoginRequest):
     pool = await get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
@@ -64,7 +101,7 @@ async def login(req: LoginRequest):
         )
         if not user or not user["password_hash"]:
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        password = req.password[:72]  # bcrypt max is 72 bytes
+        password = req.password[:BCRYPT_MAX_BYTES]  # bcrypt max is 72 bytes
         if not pwd_context.verify(password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         token = create_token(user["id"], req.email)
@@ -84,7 +121,8 @@ class ResetPasswordRequest(BaseModel):
     new_password: str
 
 @router.post("/forgot-password")
-async def forgot_password(req: ForgotPasswordRequest):
+@_rate_limit("3/minute")
+async def forgot_password(request: Request, req: ForgotPasswordRequest):
     pool = await get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow("SELECT id, name FROM users WHERE email = $1", req.email)
@@ -92,7 +130,11 @@ async def forgot_password(req: ForgotPasswordRequest):
         if not user:
             return {"status": "If that email exists, a reset code has been sent"}
 
-        code = f"{random.randint(0, 999999):06d}"
+        # SECURITY: use secrets.SystemRandom (CSPRNG), not random.randint (Mersenne
+        # Twister — predictable from a few outputs). 6 digits is still only ~20 bits
+        # of entropy; the rate limit on /reset-password is what makes brute-force
+        # infeasible. Consider migrating to a 128-bit URL token in a follow-up.
+        code = f"{_secrets.SystemRandom().randrange(1_000_000):06d}"
         expires = datetime.utcnow() + timedelta(minutes=15)
 
         await conn.execute(
@@ -100,18 +142,22 @@ async def forgot_password(req: ForgotPasswordRequest):
             code, expires, user["id"]
         )
 
-        # TODO: Send via Twilio when configured
-        # For now, print to terminal so you can test
-        print(f"\n{'='*40}")
-        print(f"  PASSWORD RESET CODE for {req.email}")
-        print(f"  Code: {code}  (expires in 15 min)")
-        print(f"{'='*40}\n")
+        # Print to stdout only OUTSIDE production. Logging reset codes to Railway
+        # makes them visible to anyone with log access.
+        from config import IS_PROD
+        if not IS_PROD:
+            print(f"\n{'='*40}")
+            print(f"  PASSWORD RESET CODE for {req.email}")
+            print(f"  Code: {code}  (expires in 15 min)")
+            print(f"{'='*40}\n")
+        # TODO: send via SMTP/Twilio in production.
 
     return {"status": "If that email exists, a reset code has been sent"}
 
 
 @router.post("/reset-password")
-async def reset_password(req: ResetPasswordRequest):
+@_rate_limit("5/minute")
+async def reset_password(request: Request, req: ResetPasswordRequest):
     pool = await get_pool()
     async with pool.acquire() as conn:
         user = await conn.fetchrow(
@@ -127,7 +173,10 @@ async def reset_password(req: ResetPasswordRequest):
         if datetime.utcnow() > user["reset_token_expires"]:
             raise HTTPException(status_code=400, detail="Reset code has expired. Please request a new one.")
 
-        hashed = pwd_context.hash(req.new_password)
+        # SECURITY: apply the SAME 72-byte truncation as signup/login.
+        # Without this, a long password set via reset would be saved as bcrypt(full)
+        # but login truncates to 72 bytes and the comparison would fail.
+        hashed = pwd_context.hash(req.new_password[:BCRYPT_MAX_BYTES])
         await conn.execute(
             "UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2",
             hashed, user["id"]

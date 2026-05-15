@@ -2,19 +2,88 @@ from fastapi import APIRouter, Depends, UploadFile, File, HTTPException, Backgro
 from api.auth import get_current_user
 from db import get_pool
 from matcher import score_jobs
+from secrets_crypto import encrypt, decrypt
 from pydantic import BaseModel
 import json
 import os
+import re
+import uuid
 
 router = APIRouter()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
+# Resume upload limits.
+MAX_RESUME_BYTES = 5 * 1024 * 1024  # 5 MB
+ALLOWED_RESUME_EXTS = (".pdf", ".doc", ".docx")
+# Magic-byte sniffing — never trust the client's Content-Type or filename alone.
+RESUME_MAGIC = (
+    (b"%PDF-", ".pdf"),                                       # PDF
+    (b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", ".doc"),            # MS OLE (legacy .doc)
+    (b"PK\x03\x04", ".docx"),                                 # ZIP container (modern .docx)
+)
+
+# Keys in user.preferences that hold secrets we want to encrypt at rest.
+ENCRYPTED_PREF_KEYS = ("imap_pass",)
+
 
 def get_supabase():
     from supabase import create_client
     return create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+
+def _safe_resume_filename(original: str) -> str:
+    """
+    Build a safe storage filename. We discard the client filename entirely
+    (path traversal, special chars, unicode tricks) and keep only the
+    extension after validating against the allow-list.
+    """
+    ext = os.path.splitext(original or "")[1].lower()
+    if ext not in ALLOWED_RESUME_EXTS:
+        ext = ".pdf"
+    return f"resume_{uuid.uuid4().hex}{ext}"
+
+
+def _sniff_extension(content: bytes) -> str | None:
+    for magic, ext in RESUME_MAGIC:
+        if content.startswith(magic):
+            return ext
+    return None
+
+
+def _parse_prefs(raw) -> dict:
+    if not raw:
+        return {}
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except Exception:
+            return {}
+    return raw
+
+
+def _encrypt_secret_prefs(prefs: dict) -> dict:
+    """Encrypt designated secret fields in-place before persisting."""
+    out = dict(prefs or {})
+    for k in ENCRYPTED_PREF_KEYS:
+        v = out.get(k)
+        if v and isinstance(v, str):
+            # Re-encrypt if plaintext, or leave alone if already encrypted.
+            from secrets_crypto import is_encrypted
+            if not is_encrypted(v):
+                out[k] = encrypt(v)
+    return out
+
+
+def _redact_secret_prefs(prefs: dict) -> dict:
+    """Decrypt for the owner — they can see/edit their own secrets."""
+    out = dict(prefs or {})
+    for k in ENCRYPTED_PREF_KEYS:
+        v = out.get(k)
+        if v and isinstance(v, str):
+            out[k] = decrypt(v)
+    return out
 
 
 class ProfileUpdate(BaseModel):
@@ -33,24 +102,39 @@ async def get_profile(user=Depends(get_current_user)):
         if not row:
             raise HTTPException(status_code=404, detail="User not found")
         result = dict(row)
-        prefs = result.get("preferences") or {}
-        if isinstance(prefs, str):
-            try:
-                prefs = json.loads(prefs)
-            except Exception:
-                prefs = {}
-        result["preferences"] = prefs
+        prefs = _parse_prefs(result.get("preferences"))
+        # Decrypt so the owner sees their own values in the form.
+        result["preferences"] = _redact_secret_prefs(prefs)
         return result
 
 
 @router.put("/")
 async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+    # Reject obviously oversized payloads. The /profile/ PUT historically
+    # accepted an unbounded dict; a malicious client could send tens of MB.
+    name = data.get("name")
+    if name is not None and (not isinstance(name, str) or len(name) > 200):
+        raise HTTPException(status_code=400, detail="Invalid name")
+
+    prefs_in = data.get("preferences") or {}
+    if not isinstance(prefs_in, dict):
+        raise HTTPException(status_code=400, detail="preferences must be an object")
+    # Hard cap on serialized size of preferences to keep the JSONB column sane.
+    try:
+        encoded = json.dumps(prefs_in)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="preferences must be JSON-serializable")
+    if len(encoded) > 64 * 1024:  # 64 KB
+        raise HTTPException(status_code=413, detail="preferences too large")
+
+    prefs_encrypted = _encrypt_secret_prefs(prefs_in)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
-            UPDATE users SET name = $1, preferences = $2
+            UPDATE users SET name = COALESCE($1, name), preferences = $2
             WHERE id = $3
-        """, data.get("name"), json.dumps(data.get("preferences", {})), user["user_id"])
+        """, name, json.dumps(prefs_encrypted), user["user_id"])
     # Rescore all jobs in background using the updated profile
     background_tasks.add_task(score_jobs, user["user_id"], None, True)
     return {"status": "updated", "rescoring": True}
@@ -62,38 +146,58 @@ async def upload_resume(
     background_tasks: BackgroundTasks = None,
     user=Depends(get_current_user),
 ):
-    if not file.filename or not file.filename.lower().endswith((".pdf", ".doc", ".docx")):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+        raise HTTPException(status_code=500, detail="Storage not configured")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+    if not file.filename.lower().endswith(ALLOWED_RESUME_EXTS):
         raise HTTPException(status_code=400, detail="Only PDF, DOC, DOCX allowed")
 
-    if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-        raise HTTPException(status_code=500, detail="Supabase not configured")
+    # SECURITY: read with a size cap so a hostile client can't OOM the server.
+    content = await file.read(MAX_RESUME_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(content) > MAX_RESUME_BYTES:
+        raise HTTPException(
+            status_code=413, detail=f"File too large (max {MAX_RESUME_BYTES // (1024*1024)} MB)"
+        )
 
-    content = await file.read()
+    # Validate by magic bytes — Content-Type and the filename ext are both
+    # client-controlled. A user could upload an EXE renamed to .pdf otherwise.
+    if not _sniff_extension(content):
+        raise HTTPException(status_code=400, detail="File contents do not look like a resume (PDF/DOC/DOCX)")
+
+    # Build a safe storage path that discards the original filename entirely.
+    safe_name = _safe_resume_filename(file.filename)
+    file_path = f"{user['user_id']}/{safe_name}"
+
     supabase = get_supabase()
-    file_path = f"{user['user_id']}/resume_{file.filename}"
-
     supabase.storage.from_("resumes").upload(
         file_path,
         content,
         {"content-type": file.content_type or "application/pdf", "x-upsert": "true"}
     )
 
-    signed = supabase.storage.from_("resumes").create_signed_url(file_path, 60 * 60 * 24 * 365)
+    # Short-lived signed URL (1 hour). Previously this was 365 DAYS, which
+    # meant a once-compromised account leaked the resume URL permanently.
+    # The frontend can request a fresh URL via /profile/resume/download whenever
+    # it needs to render or download.
+    signed = supabase.storage.from_("resumes").create_signed_url(file_path, 60 * 60)
     resume_url = signed.get("signedURL") or signed.get("signedUrl") or signed.get("path", "")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE users SET resume_url = $1 WHERE id = $2",
-            resume_url,
-            user["user_id"],
+            resume_url, user["user_id"],
         )
 
     # Rescore all jobs with the new resume
     if background_tasks:
         background_tasks.add_task(score_jobs, user["user_id"], None, True)
 
-    return {"resume_url": resume_url, "filename": file.filename, "rescoring": True}
+    return {"resume_url": resume_url, "filename": safe_name, "rescoring": True}
 
 
 @router.post("/test-imap")
@@ -103,15 +207,11 @@ async def test_imap(user=Depends(get_current_user)):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT preferences FROM users WHERE id = $1", user["user_id"])
-    import json
-    prefs = row["preferences"] if row else {}
-    if isinstance(prefs, str):
-        try:
-            prefs = json.loads(prefs)
-        except Exception:
-            prefs = {}
+    prefs = _parse_prefs(row["preferences"] if row else None)
+
     imap_user = (prefs or {}).get("imap_user", "")
-    imap_pass = (prefs or {}).get("imap_pass", "")
+    # SECURITY: IMAP password is stored encrypted in the DB; decrypt for runtime use.
+    imap_pass = decrypt((prefs or {}).get("imap_pass", ""))
     if not imap_user or not imap_pass:
         raise HTTPException(status_code=400, detail="No IMAP credentials saved — fill in Gmail and App Password first")
     try:
@@ -125,7 +225,9 @@ async def test_imap(user=Depends(get_current_user)):
             raise HTTPException(status_code=400, detail="Wrong password — make sure you're using a Gmail App Password, not your regular Gmail password. Go to myaccount.google.com/apppasswords to generate one.")
         raise HTTPException(status_code=400, detail=f"IMAP error: {err}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Connection failed: {e}")
+        # Don't leak full stack details to clients
+        print(f"  ⚠ IMAP test failed for user {user['user_id']}: {e}")
+        raise HTTPException(status_code=500, detail="IMAP connection failed")
 
 
 @router.post("/rescore")
@@ -137,6 +239,11 @@ async def rescore_jobs(background_tasks: BackgroundTasks, user=Depends(get_curre
 
 @router.get("/resume/download")
 async def get_resume_url(user=Depends(get_current_user)):
+    """
+    Mint a FRESH short-lived signed URL each time. Previously we returned the
+    stored URL, which was a 365-day token — anyone who once compromised an
+    account leaked an immortal download link.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -144,4 +251,24 @@ async def get_resume_url(user=Depends(get_current_user)):
         )
         if not row or not row["resume_url"]:
             raise HTTPException(status_code=404, detail="No resume uploaded")
-        return {"resume_url": row["resume_url"]}
+
+    # Try to derive storage path from the stored URL; fall back to the URL as-is.
+    stored = row["resume_url"]
+    storage_path = None
+    m = re.search(r"/resumes/([^?]+)", stored or "")
+    if m:
+        storage_path = m.group(1)
+
+    if not storage_path or not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        # Best effort — return the stored URL. (Older accounts may have
+        # a different URL shape; we don't want to break their access.)
+        return {"resume_url": stored}
+
+    try:
+        signed = get_supabase().storage.from_("resumes").create_signed_url(
+            storage_path, 60 * 10  # 10 min — long enough to download, short enough to be safe
+        )
+        return {"resume_url": signed.get("signedURL") or signed.get("signedUrl") or stored}
+    except Exception as e:
+        print(f"  ⚠ Failed to mint signed URL for user {user['user_id']}: {e}")
+        return {"resume_url": stored}

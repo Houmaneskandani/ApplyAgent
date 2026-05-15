@@ -317,5 +317,12 @@ async def _submit_sr(page, job: dict) -> str:
         print(f"    ✗ {len(errors)} error(s) found")
         return "failed"
 
-    print("    ✓ No errors — treating as applied")
-    return "applied"
+    # No positive confirmation and no visible errors → outcome unknown.
+    # SmartRecruiters tenants often sit behind PerimeterX which silently
+    # blocks submission without raising a visible error. See AUDIT notes.
+    print("    ⚠ No success confirmation and no errors — outcome unknown")
+    try:
+        await page.screenshot(path=f"screenshots/sr_unknown_{job.get('id', 'unknown')}.png")
+    except Exception:
+        pass
+    return "unknown"

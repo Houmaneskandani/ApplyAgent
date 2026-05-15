@@ -405,5 +405,12 @@ async def _submit_generic(page, job: dict) -> str:
         print(f"    ✗ {len(errors)} error(s) found")
         return "failed"
 
-    print("    ✓ No errors — treating as applied")
-    return "applied"
+    # No positive confirmation and no visible errors → outcome unknown.
+    # The generic fallback runs on unknown ATSes where we have no idea what
+    # success looks like — never lie about success.
+    print("    ⚠ No success confirmation and no errors — outcome unknown")
+    try:
+        await page.screenshot(path=f"screenshots/generic_unknown_{job.get('id', 'unknown')}.png")
+    except Exception:
+        pass
+    return "unknown"

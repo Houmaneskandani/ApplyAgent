@@ -1,7 +1,17 @@
 venv/
 .env
+.env.*
+!.env.example
 *.db
 screenshots/
 __pycache__/
 *.pyc
 .python-version
+
+# Personal data — never commit
+resume.pdf
+resume.docx
+*.resume.pdf
+*.resume.docx
+storage_state/
+.DS_Store

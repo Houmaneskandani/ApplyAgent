@@ -356,5 +356,14 @@ async def _submit_ashby(page, job: dict) -> str:
         print(f"    ✗ {len(errors)} validation error(s)")
         return "failed"
 
-    print("    ✓ No errors detected — treating as applied")
-    return "applied"
+    # No positive confirmation AND no visible errors. This is the classic
+    # bot-blocked-but-quiet case (Cloudflare / Akamai / PerimeterX silent
+    # interstitial, or hCaptcha that failed silently). Do NOT lie and say
+    # "applied" — return "unknown" so the user can verify manually and we
+    # don't burn a credit on a submission that may have been blocked.
+    print("    ⚠ No success confirmation and no errors — outcome unknown")
+    try:
+        await page.screenshot(path=f"screenshots/ashby_unknown_{job.get('id', 'unknown')}.png")
+    except Exception:
+        pass
+    return "unknown"
