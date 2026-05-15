@@ -74,7 +74,12 @@ async def apply_lever(job: dict, dry_run: bool = True, user_info: dict = None, p
                     await page.screenshot(path=screenshot_path, full_page=True)
                     print(f"    ✓ DRY RUN — screenshot saved to {screenshot_path}")
                 else:
-                    result = await submit_lever(page)
+                    result = await submit_lever(
+                        page,
+                        user_info=user_info,
+                        profile_text=profile_text,
+                        job=job,
+                    )
                     return result
 
             except Exception as e:
@@ -390,8 +395,35 @@ async def _get_lever_label(page, el) -> str:
     return ""
 
 
-async def submit_lever(page, max_retries: int = 3) -> str:
-    """Submit Lever form with error retry."""
+async def submit_lever(
+    page,
+    max_retries: int = 3,
+    user_info: dict | None = None,
+    profile_text: str | None = None,
+    job: dict | None = None,
+) -> str:
+    """Submit Lever form with error retry.
+
+    Runs the pre-submit reviewer agent ONCE (before the first attempt),
+    same pattern as Greenhouse. If the reviewer blocks, the applier
+    returns "unknown" and the issues land in the user's Needs Review tab.
+    """
+    from applier.reviewer import run_pre_submit_review
+
+    # Pre-submit audit — only on the first attempt. Retries are for
+    # transient submit failures (hCaptcha glitch, network), not for
+    # re-auditing the same form.
+    blocked = await run_pre_submit_review(
+        page,
+        user_info=user_info,
+        profile_text=profile_text,
+        company=(job or {}).get("company", ""),
+        job_title=(job or {}).get("title", ""),
+        screenshot_prefix="lever_reviewer_blocked",
+    )
+    if blocked:
+        return "unknown"
+
     for attempt in range(max_retries):
         submit = page.locator(
             "button[type='submit']:has-text('Submit'), "

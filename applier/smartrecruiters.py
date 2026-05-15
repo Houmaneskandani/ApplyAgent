@@ -53,7 +53,11 @@ async def apply_smartrecruiters(job: dict, dry_run: bool = True, user_info: dict
                     print(f"    ✓ DRY RUN — screenshot saved")
                     return "dry_run"
                 else:
-                    return await _submit_sr(page, job)
+                    return await _submit_sr(
+                        page, job,
+                        user_info=user_info,
+                        profile_text=profile_text,
+                    )
 
             except Exception as e:
                 import traceback
@@ -277,8 +281,30 @@ async def _get_sr_group_label(page, first_el) -> str:
     return ""
 
 
-async def _submit_sr(page, job: dict) -> str:
-    """Submit SmartRecruiters form."""
+async def _submit_sr(
+    page,
+    job: dict,
+    user_info: dict | None = None,
+    profile_text: str | None = None,
+) -> str:
+    """Submit SmartRecruiters form.
+
+    Pre-submit reviewer audits the filled form first; on `fail` we route
+    to Needs Review instead of clicking Submit.
+    """
+    from applier.reviewer import run_pre_submit_review
+
+    blocked = await run_pre_submit_review(
+        page,
+        user_info=user_info,
+        profile_text=profile_text,
+        company=job.get("company", ""),
+        job_title=job.get("title", ""),
+        screenshot_prefix="sr_reviewer_blocked",
+    )
+    if blocked:
+        return "unknown"
+
     submit = page.locator(
         "button[type='submit']:visible, "
         "button:has-text('Send Application'):visible, "

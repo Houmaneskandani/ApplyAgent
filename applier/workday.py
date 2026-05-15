@@ -328,7 +328,16 @@ async def _fill_workday_generic_questions(page, info: dict, profile_text: str):
 
 
 async def _click_next_or_submit(page, step: int) -> bool:
-    """Click the Next or Submit button to advance the Workday wizard."""
+    """Click the Next or Submit button to advance the Workday wizard.
+
+    TODO (reviewer): Workday's wizard calls this on EVERY step (Next, Next,
+    ..., Submit). The pre-submit reviewer should run ONCE, just before the
+    final Submit — not on every Next click (each call costs ~$0.01 + 10s).
+    Detecting "this is the final step" requires reading the button text
+    of whichever candidate locator matched. Defer until we have a real
+    Workday application to test against; for now the reviewer is wired
+    into Lever / Ashby / SmartRecruiters / Generic / Greenhouse.
+    """
     # Prefer "Submit" on later steps
     candidates = [
         "button:has-text('Submit'):visible",

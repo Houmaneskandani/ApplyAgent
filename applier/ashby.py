@@ -42,7 +42,11 @@ async def apply_ashby(job: dict, dry_run: bool = True, user_info: dict = None, p
                     print(f"    ✓ DRY RUN — screenshot saved")
                     return "dry_run"
                 else:
-                    return await _submit_ashby(page, job)
+                    return await _submit_ashby(
+                        page, job,
+                        user_info=user_info,
+                        profile_text=profile_text,
+                    )
 
             except Exception as e:
                 import traceback
@@ -314,8 +318,30 @@ async def _get_ashby_label(page, el) -> str:
     return ""
 
 
-async def _submit_ashby(page, job: dict) -> str:
-    """Submit the Ashby form and detect success."""
+async def _submit_ashby(
+    page,
+    job: dict,
+    user_info: dict | None = None,
+    profile_text: str | None = None,
+) -> str:
+    """Submit the Ashby form and detect success.
+
+    Runs the pre-submit reviewer agent — if the reviewer blocks, we
+    return "unknown" and route to Needs Review without clicking Submit.
+    """
+    from applier.reviewer import run_pre_submit_review
+
+    blocked = await run_pre_submit_review(
+        page,
+        user_info=user_info,
+        profile_text=profile_text,
+        company=job.get("company", ""),
+        job_title=job.get("title", ""),
+        screenshot_prefix="ashby_reviewer_blocked",
+    )
+    if blocked:
+        return "unknown"
+
     submit = page.locator(
         "button[type='submit']:visible, "
         "button:has-text('Submit application'):visible, "
