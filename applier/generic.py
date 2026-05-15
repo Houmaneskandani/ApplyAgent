@@ -77,7 +77,11 @@ async def apply_generic(job: dict, dry_run: bool = True, user_info: dict = None,
                     print(f"    ✓ DRY RUN — screenshot saved")
                     return "dry_run"
                 else:
-                    return await _submit_generic(page, job)
+                    return await _submit_generic(
+                        page, job,
+                        user_info=user_info,
+                        profile_text=profile_text,
+                    )
 
             except Exception as e:
                 import traceback
@@ -355,8 +359,32 @@ async def _get_generic_group_label(page, first_el) -> str:
     return ""
 
 
-async def _submit_generic(page, job: dict) -> str:
-    """Generic submit — tries common submit button patterns."""
+async def _submit_generic(
+    page,
+    job: dict,
+    user_info: dict | None = None,
+    profile_text: str | None = None,
+) -> str:
+    """Generic submit — tries common submit button patterns.
+
+    Pre-submit reviewer audits the filled form first; on `fail` we route
+    to Needs Review without submitting. The generic applier is the
+    riskiest of the bunch (unknown ATS shape), so the reviewer's
+    second-pair-of-eyes is particularly valuable here.
+    """
+    from applier.reviewer import run_pre_submit_review
+
+    blocked = await run_pre_submit_review(
+        page,
+        user_info=user_info,
+        profile_text=profile_text,
+        company=job.get("company", ""),
+        job_title=job.get("title", ""),
+        screenshot_prefix="generic_reviewer_blocked",
+    )
+    if blocked:
+        return "unknown"
+
     submit = page.locator(
         "button[type='submit']:visible, "
         "input[type='submit']:visible, "
