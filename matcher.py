@@ -61,13 +61,44 @@ def extract_text_from_pdf(path: str) -> str:
         return ""
 
 
+async def _mint_fresh_resume_url(stored_url: str) -> str:
+    """
+    Phase 1 cut Supabase signed-URL lifetime from 365 days to 1 hour, so
+    `users.resume_url` in the DB is often expired by the time we scrape +
+    score. Parse the storage path out of the URL and mint a fresh signed
+    URL. (Same logic as api/routes/apply.py — should probably be a shared
+    helper, but for now the duplication is small and self-contained.)
+    """
+    import os as _os, re as _re
+    SUPABASE_URL = _os.getenv("SUPABASE_URL")
+    SUPABASE_SERVICE_KEY = _os.getenv("SUPABASE_SERVICE_KEY")
+    if not (SUPABASE_URL and SUPABASE_SERVICE_KEY):
+        return stored_url
+    m = _re.search(r"/resumes/([^?]+)", stored_url or "")
+    if not m:
+        return stored_url
+    storage_path = m.group(1)
+    try:
+        from supabase import create_client
+        sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+        signed = sb.storage.from_("resumes").create_signed_url(storage_path, 60 * 5)
+        return signed.get("signedURL") or signed.get("signedUrl") or stored_url
+    except Exception as e:
+        print(f"  ⚠ Matcher could not mint fresh resume URL: {e} — using stored")
+        return stored_url
+
+
 async def download_resume_from_url(resume_url: str) -> str:
     """Download resume from Supabase Storage and extract text."""
     try:
         import httpx
+        # Mint a fresh signed URL — the stored one is likely expired
+        # (Phase 1 dropped lifetime from 365 days to 1 hour).
+        fresh_url = await _mint_fresh_resume_url(resume_url)
         async with httpx.AsyncClient(timeout=20) as client:
-            r = await client.get(resume_url)
+            r = await client.get(fresh_url)
             if r.status_code != 200:
+                print(f"  ⚠ Resume URL returned {r.status_code} — scoring without resume content")
                 return ""
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(r.content)
