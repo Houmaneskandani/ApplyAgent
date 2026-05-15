@@ -56,6 +56,11 @@ NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", "")
 # Generate with:  python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 SECRETS_ENCRYPTION_KEY = os.getenv("SECRETS_ENCRYPTION_KEY", "")
 
+# Sentry error tracking. If SENTRY_DSN is empty (the default), Sentry init is
+# a no-op and the rest of the app runs identically. Set in production.
+SENTRY_DSN = os.getenv("SENTRY_DSN", "")
+SENTRY_TRACES_SAMPLE_RATE = float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.1"))
+
 
 # ─── Validation ─────────────────────────────────────────────────────
 def _fail(msg: str) -> None:

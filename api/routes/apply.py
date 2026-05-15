@@ -312,6 +312,73 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
             print(f"  ✓ Cleaned up temp resume")
 
 
+@router.post("/{job_id}/confirm")
+async def confirm_unknown_apply(job_id: int, user=Depends(get_current_user)):
+    """
+    User manually confirmed that an `unknown` apply landed successfully.
+    Promote the row to `applied` and charge the credit (the bot did the
+    actual work — Claude tokens, browser session — so this is fair).
+    """
+    user_id = user["user_id"]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT status FROM applications WHERE user_id = $1 AND job_id = $2",
+            user_id, job_id,
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Application not found")
+        if existing["status"] == "applied":
+            return {"status": "applied", "already": True}
+        if existing["status"] != "unknown":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Can only confirm applications in 'unknown' state (current: {existing['status']})",
+            )
+        # Atomic credit deduction. If the user has 0 credits, allow the
+        # confirmation but don't go negative — the bot already did the work,
+        # we're not going to refuse a "yes it worked" confirmation. Best-effort.
+        deducted = await deduct_credits(user_id, 0.4)
+        await conn.execute(
+            """
+            UPDATE applications
+               SET status = 'applied', applied_at = COALESCE(applied_at, NOW()),
+                   notes = CASE WHEN $3 THEN 'Manually confirmed — credit charged'
+                                ELSE 'Manually confirmed — credit waived (low balance)' END
+             WHERE user_id = $1 AND job_id = $2
+            """,
+            user_id, job_id, deducted,
+        )
+    return {"status": "applied", "credit_deducted": deducted}
+
+
+@router.post("/{job_id}/retry")
+async def retry_application(job_id: int, user=Depends(get_current_user)):
+    """
+    Reset an `unknown` or `failed` row back to `new` so the user can re-queue it.
+    Does NOT charge a credit (the new apply will charge if it succeeds).
+    """
+    user_id = user["user_id"]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT status FROM applications WHERE user_id = $1 AND job_id = $2",
+            user_id, job_id,
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Application not found")
+        if existing["status"] in ("applied", "applying", "queued"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot retry — application is {existing['status']}",
+            )
+        await conn.execute(
+            "UPDATE applications SET status = 'new', notes = NULL WHERE user_id = $1 AND job_id = $2",
+            user_id, job_id,
+        )
+    return {"status": "reset"}
+
+
 @router.post("/{job_id}")
 async def apply_to_job(
     job_id: int,

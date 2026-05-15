@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,8 +8,31 @@ from fastapi.middleware.cors import CORSMiddleware
 # IMPORTANT: validate required env vars BEFORE any route module is imported.
 # This guarantees that a misconfigured production deploy crashes immediately
 # instead of silently running with insecure defaults.
-from config import validate_config
+from config import validate_config, SENTRY_DSN, SENTRY_TRACES_SAMPLE_RATE, APP_ENV
 validate_config(strict=True)
+
+# ─── Sentry (optional — set SENTRY_DSN to enable) ──────────────────────
+# No-op when DSN is unset, so this is safe for local dev and CI.
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.fastapi import FastApiIntegration
+        from sentry_sdk.integrations.asyncio import AsyncioIntegration
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            environment=APP_ENV,
+            traces_sample_rate=SENTRY_TRACES_SAMPLE_RATE,
+            integrations=[FastApiIntegration(), AsyncioIntegration()],
+            # Don't include PII in error reports (we have IMAP passwords,
+            # emails, names, addresses in the DB — none of that should leak
+            # to error logs).
+            send_default_pii=False,
+        )
+        print(f"  ✓ Sentry enabled (env={APP_ENV}, traces={SENTRY_TRACES_SAMPLE_RATE})")
+    except ImportError:
+        print("  ⚠ SENTRY_DSN set but sentry-sdk not installed")
+    except Exception as e:
+        print(f"  ⚠ Sentry init failed: {e}")
 
 from api.auth import router as auth_router  # noqa: E402  (imports must follow validation)
 from api.routes.jobs import router as jobs_router  # noqa: E402
@@ -86,6 +110,100 @@ app.include_router(queue_router,       prefix="/queue",        tags=["queue"])
 app.include_router(auto_apply_router,  prefix="/auto-apply",   tags=["auto-apply"])
 
 
+_BOOT_TIME = time.time()
+
+
 @app.get("/")
 async def root():
     return {"status": "JobBot API running"}
+
+
+@app.get("/health")
+async def health():
+    """
+    Liveness + dependency check. Returns 200 only if the DB ping succeeds.
+    Background-task health (scheduler, worker) is NOT in scope here — that
+    belongs in a separate /admin/health endpoint protected by the operator.
+
+    Used by Railway healthcheckPath and by uptime monitors. Safe to expose
+    publicly because it returns no PII.
+    """
+    checks: dict[str, dict] = {}
+    overall_ok = True
+
+    # Database ping. asyncpg connection pool warm-up time is what we measure.
+    try:
+        from db import get_pool
+        t0 = time.perf_counter()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await asyncio.wait_for(conn.fetchval("SELECT 1"), timeout=3.0)
+        checks["database"] = {"ok": True, "latency_ms": round((time.perf_counter() - t0) * 1000, 1)}
+    except Exception as e:
+        checks["database"] = {"ok": False, "error": type(e).__name__}
+        overall_ok = False
+
+    # Required-secret presence (NOT validity — we never call out to verify).
+    from config import ANTHROPIC_API_KEY, STRIPE_SECRET_KEY, CAPSOLVER_API_KEY, SECRETS_ENCRYPTION_KEY
+    checks["anthropic"]  = {"configured": bool(ANTHROPIC_API_KEY)}
+    checks["stripe"]     = {"configured": bool(STRIPE_SECRET_KEY)}
+    checks["capsolver"]  = {"configured": bool(CAPSOLVER_API_KEY)}
+    checks["secrets_at_rest"] = {"configured": bool(SECRETS_ENCRYPTION_KEY)}
+
+    return {
+        "status": "ok" if overall_ok else "degraded",
+        "uptime_seconds": round(time.time() - _BOOT_TIME, 1),
+        "env": APP_ENV,
+        "checks": checks,
+    }
+
+
+@app.get("/stats/public")
+async def public_stats():
+    """
+    Public-safe aggregates used by the marketing page. NEVER returns PII.
+    Anyone (including unauthenticated visitors) can call this — the numbers
+    here are intentional trust signals.
+    """
+    try:
+        from db import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            total_users   = await conn.fetchval("SELECT COUNT(*) FROM users") or 0
+            total_jobs    = await conn.fetchval("SELECT COUNT(*) FROM jobs") or 0
+            total_applied = await conn.fetchval(
+                "SELECT COUNT(*) FROM applications WHERE status = 'applied'"
+            ) or 0
+            applied_today = await conn.fetchval(
+                "SELECT COUNT(*) FROM applications WHERE status = 'applied' "
+                "AND applied_at > NOW() - INTERVAL '24 hours'"
+            ) or 0
+            # Success rate over the last 7 days — bot applies that landed
+            # vs. bot applies we tried at all (excludes dry runs and 'new').
+            recent_attempts = await conn.fetchval(
+                "SELECT COUNT(*) FROM applications "
+                "WHERE applied_at > NOW() - INTERVAL '7 days' "
+                "AND status IN ('applied', 'failed', 'unknown') "
+                "AND dry_run = FALSE"
+            ) or 0
+            recent_applied = await conn.fetchval(
+                "SELECT COUNT(*) FROM applications "
+                "WHERE applied_at > NOW() - INTERVAL '7 days' "
+                "AND status = 'applied' AND dry_run = FALSE"
+            ) or 0
+        rate = round(100 * recent_applied / recent_attempts, 1) if recent_attempts else None
+        return {
+            "users": int(total_users),
+            "jobs_indexed": int(total_jobs),
+            "applications_submitted": int(total_applied),
+            "applications_submitted_today": int(applied_today),
+            "success_rate_7d_pct": rate,
+        }
+    except Exception:
+        # Marketing endpoint must NEVER error in a user-facing way.
+        return {
+            "users": None, "jobs_indexed": None,
+            "applications_submitted": None,
+            "applications_submitted_today": None,
+            "success_rate_7d_pct": None,
+        }
