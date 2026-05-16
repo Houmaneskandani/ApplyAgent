@@ -5,6 +5,29 @@ from db import get_pool
 router = APIRouter()
 
 
+def classify_ats(source: str | None, url: str | None) -> str:
+    """
+    Return the effective ATS bucket the apply-dispatcher will route to.
+    Mirrors the routing logic in api/routes/apply.py:run_application
+    EXACTLY (same source values + URL substrings). One source of truth
+    so the dashboard filter, the per-ATS stats, and the actual apply
+    dispatcher can never disagree on what counts as "Lever".
+    """
+    src = (source or "").lower()
+    url_l = (url or "").lower()
+    if src == "greenhouse" or "greenhouse.io" in url_l or "gh_jid" in url_l:
+        return "greenhouse"
+    if src == "lever" or "lever.co" in url_l:
+        return "lever"
+    if src == "ashby" or "ashby.io" in url_l or "ashbyhq.com" in url_l:
+        return "ashby"
+    if src == "smartrecruiters" or "smartrecruiters.com" in url_l:
+        return "smartrecruiters"
+    if src == "workday" or "myworkdayjobs.com" in url_l or "workday.com" in url_l:
+        return "workday"
+    return "generic"
+
+
 def detect_experience_level(title: str, description: str = "") -> str:
     """
     Heuristic seniority detection. Returns one of the values in the
@@ -119,6 +142,11 @@ async def get_jobs(min_score: int = 1, limit: int = 100, user=Depends(get_curren
                 job["posted_at"] = time_ago(job.get("created_at"))
                 raw_dt = job.get("created_at")
                 job["created_at"] = raw_dt.isoformat() if raw_dt else None
+                # `ats` is the bucket the apply-dispatcher will route to.
+                # NOT the same as `source` — e.g. a job scraped from
+                # Indeed often redirects to a Greenhouse URL, so the
+                # scrape source is "indeed" but the applier is "greenhouse".
+                job["ats"] = classify_ats(job.get("source"), job.get("url"))
                 # We strip the full description from the list response (it
                 # bloats the payload + can be MBs of HTML). But we DO emit a
                 # plain-text snippet so the frontend keyword filter can match
