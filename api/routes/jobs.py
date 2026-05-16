@@ -92,22 +92,72 @@ def time_ago(dt) -> str:
 
 
 @router.get("/")
-async def get_jobs(min_score: int = 1, limit: int = 100, user=Depends(get_current_user)):
+async def get_jobs(
+    min_score: int = 1,
+    limit: int = 100,
+    ats: str | None = None,
+    user=Depends(get_current_user),
+):
+    """
+    List the user's top-scored jobs.
+
+    `ats` (optional): one of greenhouse | lever | ashby | workday |
+    smartrecruiters | generic. When provided, joins to `jobs` and
+    filters by the dispatcher's effective applier — same CASE expression
+    as classify_ats(). Solves the "I can't find any Lever jobs because
+    Greenhouse dominates my top 200" visibility problem on the dashboard.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         user_id = int(user["user_id"])
-        apps = await conn.fetch(
-            """
-            SELECT job_id, score, status, applied_at, notes
-            FROM applications
-            WHERE user_id = $1 AND score >= $2
-            ORDER BY score DESC
-            LIMIT $3
-        """,
-            user_id,
-            min_score,
-            limit,
-        )
+        # SAFETY: validate `ats` against the known applier set so the
+        # CASE-equality below never sees an attacker-controlled string.
+        VALID_ATS = {"greenhouse", "lever", "ashby", "workday", "smartrecruiters", "generic"}
+        ats_filter = ats if ats in VALID_ATS else None
+
+        if ats_filter:
+            # Apply the same CASE classifier inline against the joined
+            # jobs row so we filter BEFORE the LIMIT (otherwise the
+            # top-N-by-score would still drop Lever in favor of
+            # Greenhouse jobs that fill the slots).
+            apps = await conn.fetch(
+                """
+                SELECT a.job_id, a.score, a.status, a.applied_at, a.notes
+                  FROM applications a
+                  JOIN jobs j ON j.id = a.job_id
+                 WHERE a.user_id = $1 AND a.score >= $2
+                   AND CASE
+                         WHEN j.source = 'greenhouse'
+                           OR j.url LIKE '%greenhouse.io%'
+                           OR j.url LIKE '%gh_jid%'   THEN 'greenhouse'
+                         WHEN j.source = 'lever'
+                           OR j.url LIKE '%lever.co%' THEN 'lever'
+                         WHEN j.source = 'ashby'
+                           OR j.url LIKE '%ashby.io%'
+                           OR j.url LIKE '%ashbyhq.com%' THEN 'ashby'
+                         WHEN j.source = 'smartrecruiters'
+                           OR j.url LIKE '%smartrecruiters.com%' THEN 'smartrecruiters'
+                         WHEN j.source = 'workday'
+                           OR j.url LIKE '%myworkdayjobs.com%'
+                           OR j.url LIKE '%workday.com%' THEN 'workday'
+                         ELSE 'generic'
+                       END = $4
+                 ORDER BY a.score DESC
+                 LIMIT $3
+                """,
+                user_id, min_score, limit, ats_filter,
+            )
+        else:
+            apps = await conn.fetch(
+                """
+                SELECT job_id, score, status, applied_at, notes
+                  FROM applications
+                 WHERE user_id = $1 AND score >= $2
+                 ORDER BY score DESC
+                 LIMIT $3
+                """,
+                user_id, min_score, limit,
+            )
 
         if not apps:
             return []
