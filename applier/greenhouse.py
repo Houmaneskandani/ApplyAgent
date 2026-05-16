@@ -668,6 +668,38 @@ async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = No
 
                 frame = await get_frame(page)
 
+                # CLOSED-JOB DETECTION: Greenhouse serves `embed/job_app` for
+                # actual application forms and `embed/job_board` for company-
+                # wide job listing pages. When a posting is closed, Greenhouse
+                # redirects the embed iframe to the job_board listing instead
+                # of throwing a 404 (this is what bit us on Okta's 7679013 +
+                # 7640026 — 2 failures in one hour: bot landed on the listing,
+                # "filled" 0 fields, logged ✓ Form filled!, failed at submit
+                # with the cryptic "Submit button not found"; vision AI later
+                # confirmed via OCR that the page had a "The job you are
+                # looking for is no longer open" banner).
+                #
+                # Detect it by the frame URL alone — much faster + more
+                # reliable than text scraping, and works even when the parent
+                # window's URL still looks like a job link.
+                frame_url = getattr(frame, "url", "") or ""
+                if "job_board" in frame_url and "job_app" not in frame_url:
+                    print(f"    ✗ Greenhouse landed on job_board listing — posting is closed "
+                          f"(frame: {frame_url[:90]})")
+                    if info is not None:
+                        info["_reviewer_notes"] = (
+                            "Greenhouse job posting is closed: the embed loaded the company's "
+                            "job_board listing instead of the application form."
+                        )
+                    try:
+                        os.makedirs("screenshots", exist_ok=True)
+                        await page.screenshot(
+                            path=f"screenshots/gh_closed_{job_id}.png"
+                        )
+                    except Exception:
+                        pass
+                    return "failed"
+
                 await fill_by_id(frame, "first_name", info.get("first_name", ""))
                 await fill_by_id(frame, "last_name", info.get("last_name", ""))
                 await fill_by_id(frame, "email", info.get("email", ""))
