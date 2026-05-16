@@ -173,8 +173,22 @@ async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Dep
                 "SELECT preferences FROM users WHERE id = $1", user_id,
             )
             existing_prefs = _parse_prefs(existing_row["preferences"]) if existing_row else {}
+            # MERGE, don't REPLACE. The Profile form sends ONLY the keys it
+            # manages (basics, demographics, IMAP, etc.) — but
+            # `user.preferences` also holds backend-managed flags that no
+            # frontend form ever touches: `auto_apply` (set by POST
+            # /auto-apply/toggle), `last_scraped_at` (set by the scraper),
+            # and potentially future ones. Without merging, every Profile
+            # save SILENTLY WIPED auto_apply — diagnosed live at 04:07 when
+            # the hourly monitor saw auto_apply=None despite the user having
+            # toggled it on.
+            #
+            # Apply the incoming changes ON TOP of the existing prefs so
+            # form fields the user changed take precedence, but non-form
+            # keys survive.
+            merged_prefs = {**(existing_prefs or {}), **prefs_in}
             try:
-                prefs_encrypted = _merge_secret_prefs(prefs_in, existing_prefs)
+                prefs_encrypted = _merge_secret_prefs(merged_prefs, existing_prefs)
             except Exception as e:
                 print(f"  [PUT /profile/] ENCRYPT FAILED user={user_id}: {type(e).__name__}: {e}")
                 raise HTTPException(status_code=500, detail=f"Encryption error: {type(e).__name__}")
