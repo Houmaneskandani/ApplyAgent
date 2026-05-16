@@ -60,13 +60,62 @@ async def apply_lever(job: dict, dry_run: bool = True, user_info: dict = None, p
                 current_url = page.url
                 print(f"    ℹ Current URL: {current_url[:80]}")
 
+                # CLOSED-JOB DETECTION: Lever returns a real apply URL even
+                # when the role was filled/closed, just with a "Not found"
+                # page. We caught this on Plaid Staff SWE — the bot spent
+                # ~30s "filling" zero fields then failed with the cryptic
+                # "Submit button not found". Bail early with a clear
+                # explanation instead.
+                try:
+                    page_title = (await page.title()) or ""
+                    if "not found" in page_title.lower() or "404" in page_title:
+                        print(f"    ✗ Job posting appears closed (page title: {page_title!r})")
+                        try:
+                            os.makedirs("screenshots", exist_ok=True)
+                            await page.screenshot(
+                                path=f"screenshots/lever_closed_{job.get('id', 'unknown')}.png"
+                            )
+                        except Exception:
+                            pass
+                        if info is not None:
+                            info["_reviewer_notes"] = (
+                                f"Lever job posting is closed (page title: {page_title}). "
+                                f"Mark this row as 'failed' and skip future retries."
+                            )
+                        return "failed"
+                except Exception:
+                    pass  # title-check is defensive — never block the apply
+
                 # Solve any CAPTCHA on the apply form itself (hCaptcha blocks clicks)
                 await asyncio.sleep(2)
                 await wait_for_captcha_if_present(page, source="lever")
 
-                await fill_lever_form(page, user_info=info, profile_text=profile_text)
+                # `fill_lever_form` now returns the number of fields it
+                # actually filled. If we got zero, the page is in some
+                # state we don't recognize (custom Lever theme, login
+                # gate, etc.) — bail with a clear reason instead of
+                # the misleading "Submit not found" we used to emit.
+                filled_count = await fill_lever_form(
+                    page, user_info=info, profile_text=profile_text,
+                )
+                if filled_count == 0:
+                    print(f"    ✗ Form filled 0 fields — page may be using a custom Lever "
+                          f"layout or behind a login gate. URL: {current_url}")
+                    try:
+                        os.makedirs("screenshots", exist_ok=True)
+                        await page.screenshot(
+                            path=f"screenshots/lever_no_fields_{job.get('id', 'unknown')}.png"
+                        )
+                    except Exception:
+                        pass
+                    if info is not None:
+                        info["_reviewer_notes"] = (
+                            "Lever page returned but no standard fields were detected. "
+                            "Likely a custom theme, login wall, or closed job."
+                        )
+                    return "failed"
 
-                print("    ✓ Form filled!")
+                print(f"    ✓ Form filled! ({filled_count} fields)")
 
                 if dry_run:
                     os.makedirs("screenshots", exist_ok=True)
@@ -99,9 +148,16 @@ async def apply_lever(job: dict, dry_run: bool = True, user_info: dict = None, p
     return "dry_run"
 
 
-async def fill_lever_form(page, user_info: dict = None, profile_text: str = None):
-    """Fill standard Lever application fields."""
+async def fill_lever_form(page, user_info: dict = None, profile_text: str = None) -> int:
+    """
+    Fill standard Lever application fields. Returns the number of fields
+    that were successfully filled — used by the caller to detect "page
+    looked OK but nothing matched our selectors" (closed jobs, custom
+    Lever themes, login walls, etc.) so we can surface a clear failure
+    reason instead of the previous mysterious "Submit not found".
+    """
     info = user_info or {}
+    filled = 0  # count of fields we successfully wrote a value into
 
     full_name = f"{info.get('first_name', '')} {info.get('last_name', '')}".strip()
 
@@ -124,6 +180,7 @@ async def fill_lever_form(page, user_info: dict = None, profile_text: str = None
             if await el.count() > 0:
                 await el.first.fill(value)
                 print(f"    ✓ Filled {field_name}")
+                filled += 1
         except Exception as e:
             print(f"    ✗ Could not fill {field_name}: {e}")
 
@@ -134,6 +191,7 @@ async def fill_lever_form(page, user_info: dict = None, profile_text: str = None
         if resume_path and os.path.exists(resume_path):
             await resume_input.first.set_input_files(resume_path)
             print("    ✓ Resume uploaded")
+            filled += 1
             await asyncio.sleep(2)
         else:
             print("    ✗ Resume file not found")
@@ -145,9 +203,15 @@ async def fill_lever_form(page, user_info: dict = None, profile_text: str = None
         if cl_text:
             await cover.first.fill(cl_text)
             print("    ✓ Cover letter filled")
+            filled += 1
 
-    # Custom questions
+    # Custom questions (these add to `filled` opaquely — we don't track them
+    # individually, but presence of cards/customs implies a real Lever form.
+    # The standard-field count above is enough signal for closed-job
+    # detection.)
     await fill_lever_custom_questions(page, profile_text=profile_text)
+
+    return filled
 
 
 async def fill_lever_custom_questions(page, profile_text: str = None):
