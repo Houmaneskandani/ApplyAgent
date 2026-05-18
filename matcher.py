@@ -246,8 +246,9 @@ Reply with ONLY a single integer (0-10). Nothing else."""
             match = re.search(r"\b\d+\b", raw)
             if not match:
                 print(f"    ⚠ Could not parse score from response: {raw!r}")
-                return 5
-            return max(0, min(int(match.group()), 10))
+                # Treat parse failure as an error so the caller can count it.
+                return 5, True
+            return max(0, min(int(match.group()), 10)), False
         except Exception as e:
             msg = str(e)
             if "rate_limit" in msg or "429" in msg or "529" in msg:
@@ -256,9 +257,14 @@ Reply with ONLY a single integer (0-10). Nothing else."""
                 await asyncio.sleep(wait)
             else:
                 print(f"    ✗ AI scoring error: {e}")
-                return 5
+                # Non-retryable. Return the safety-net 5 BUT mark it as
+                # errored so the caller's tally doesn't mistake it for a
+                # real score. This is the exact bug that hid 47 hours of
+                # silent 401s after the worker's ANTHROPIC_API_KEY went
+                # bad — the "Done — scored: 100" message looked healthy.
+                return 5, True
     print(f"    ✗ Gave up scoring after 4 attempts (rate limit)")
-    return 5
+    return 5, True
 
 
 # ── Main scorer ────────────────────────────────────────────────────────────
@@ -302,7 +308,7 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     yrs_exp = prefs.get("years_experience", "")
     sem = asyncio.Semaphore(SCORE_CONCURRENCY)
 
-    counters = {"scored": 0, "skipped": 0}
+    counters = {"scored": 0, "errored": 0, "skipped": 0}
 
     async def score_one(job):
         job_dict = dict(job)
@@ -313,13 +319,19 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
             counters["skipped"] += 1
             return
         async with sem:
-            score = await ai_score_job(job_dict, profile_summary, years_experience=yrs_exp)
+            score, errored = await ai_score_job(job_dict, profile_summary, years_experience=yrs_exp)
         await upsert_application(user_id, job_dict["id"], score)
-        counters["scored"] += 1
-        if score >= 7:
-            print(f"  [{score}/10] ✓ {title} @ {job_dict.get('company', '')}")
-        elif score <= 3:
-            print(f"  [{score}/10] ✗ {title} @ {job_dict.get('company', '')}")
+        if errored:
+            # API error / parse failure / rate-limit-give-up. We still wrote
+            # the safety-net 5 to the DB so the job has SOME score, but it's
+            # not a real signal — don't count it as a successful score.
+            counters["errored"] += 1
+        else:
+            counters["scored"] += 1
+            if score >= 7:
+                print(f"  [{score}/10] ✓ {title} @ {job_dict.get('company', '')}")
+            elif score <= 3:
+                print(f"  [{score}/10] ✗ {title} @ {job_dict.get('company', '')}")
 
     # Run all scoring tasks concurrently. asyncio.gather preserves order on
     # return but we don't care — each task writes to the DB independently.
@@ -327,9 +339,24 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     results = await asyncio.gather(*(score_one(j) for j in jobs), return_exceptions=True)
     errors = [r for r in results if isinstance(r, Exception)]
     if errors:
-        print(f"  ⚠ {len(errors)} scoring errors (logged above)")
+        print(f"  ⚠ {len(errors)} scoring task exceptions (logged above)")
 
-    print(f"\n  Done — scored: {counters['scored']}  |  skipped (not engineering): {counters['skipped']}")
+    # Honest summary: distinguish real AI scores from default-on-error
+    # writes. If `errored` is high (esp. == total), the worker's
+    # ANTHROPIC_API_KEY is probably broken — that exact scenario hid for
+    # 47 hours because the old "Done — scored: N" looked healthy.
+    err_warning = ""
+    if counters["errored"] > 0:
+        total_scored_attempts = counters["scored"] + counters["errored"]
+        err_pct = round(100 * counters["errored"] / max(total_scored_attempts, 1), 1)
+        err_warning = f"  ⚠ {counters['errored']} ({err_pct}%) errored — check Anthropic API key + logs"
+    print(
+        f"\n  Done — scored OK: {counters['scored']}  |  "
+        f"errored (defaulted to 5): {counters['errored']}  |  "
+        f"skipped (not engineering): {counters['skipped']}"
+    )
+    if err_warning:
+        print(err_warning)
 
 
 if __name__ == "__main__":
