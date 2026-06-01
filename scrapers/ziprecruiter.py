@@ -95,9 +95,13 @@ async def scrape_ziprecruiter():
     # Reuse the project's stealth session (random fingerprint + proxy + stealth
     # patches). No user_id — this is an anonymous scrape.
     from applier.browser_utils import stealth_session
+    import job_categories
+    # Search the roles the user(s) actually want (set by the scheduler from
+    # preferences); falls back to software-engineering queries.
+    queries = job_categories.active_queries() or ZR_QUERIES
 
     async with async_playwright() as p:
-        for query in ZR_QUERIES:
+        for query in queries:
             url = _SEARCH_URL.format(kw=query.replace(" ", "+"), loc="Remote+(USA)")
             try:
                 async with stealth_session(

@@ -27,6 +27,11 @@ async def scrape_jsearch():
     all_jobs = []
     seen_urls = set()
 
+    # Search the roles the user(s) actually want (set by the scheduler from
+    # preferences); falls back to the default software-engineering queries.
+    import job_categories
+    queries = job_categories.active_queries() or JSEARCH_QUERIES
+
     async with httpx.AsyncClient(
         timeout=20,
         headers={
@@ -34,7 +39,7 @@ async def scrape_jsearch():
             "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
         },
     ) as client:
-        for query in JSEARCH_QUERIES:
+        for query in queries:
             try:
                 r = await client.get(
                     "https://jsearch.p.rapidapi.com/search",
