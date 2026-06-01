@@ -254,6 +254,8 @@ async def stealth_session(
     url: str = "",
     user_id: int | str | None = None,
     persist_state: bool = True,
+    storage_state_override: dict | None = None,
+    user_agent_override: str | None = None,
 ):
     """
     The new high-level browser entry point. Yields (browser, context, page)
@@ -275,6 +277,11 @@ async def stealth_session(
     code paths that haven't been migrated yet.
     """
     fp = _random_fingerprint()
+    # UA pinning: ZipRecruiter (and other bot-walled sites) bind their
+    # clearance cookies to the exact UA they were issued to. When replaying a
+    # captured session we MUST reuse that UA or the session gets challenged.
+    if user_agent_override:
+        fp["user_agent"] = user_agent_override
     proxy = _proxy_config()
 
     launch_kwargs = {
@@ -298,7 +305,12 @@ async def stealth_session(
         },
     }
 
-    state = _read_storage_state(user_id, url) if (persist_state and url) else None
+    # An explicit override (e.g. a ZipRecruiter session loaded from the DB)
+    # wins over the per-user FS cache. We do NOT fall back to the FS read when
+    # an override is supplied — the caller is being deliberate about identity.
+    state = storage_state_override or (
+        _read_storage_state(user_id, url) if (persist_state and url) else None
+    )
     if state:
         context_kwargs["storage_state"] = state
 

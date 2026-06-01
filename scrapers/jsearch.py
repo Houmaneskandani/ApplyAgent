@@ -61,7 +61,12 @@ async def scrape_jsearch():
 
                     # Tag the original platform as source label
                     publisher = (job.get("job_publisher") or "").lower()
-                    if "linkedin" in publisher:
+                    apply_link = (job.get("job_apply_link") or "").lower()
+                    if "ziprecruiter" in publisher or "ziprecruiter.com" in apply_link:
+                        # Tag ZR so the dispatcher routes to the 1-Click applier
+                        # and the dashboard ATS chip groups it correctly.
+                        source = "ziprecruiter"
+                    elif "linkedin" in publisher:
                         source = "linkedin"
                     elif "indeed" in publisher:
                         source = "indeed"
@@ -89,5 +94,6 @@ async def scrape_jsearch():
     await insert_jobs_batch(all_jobs)
     linkedin = sum(1 for j in all_jobs if j["source"] == "linkedin")
     indeed = sum(1 for j in all_jobs if j["source"] == "indeed")
-    print(f"  JSearch: {len(all_jobs)} jobs (LinkedIn: {linkedin}, Indeed: {indeed})")
+    zr = sum(1 for j in all_jobs if j["source"] == "ziprecruiter")
+    print(f"  JSearch: {len(all_jobs)} jobs (LinkedIn: {linkedin}, Indeed: {indeed}, ZipRecruiter: {zr})")
     return len(all_jobs)

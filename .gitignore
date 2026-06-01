@@ -15,3 +15,6 @@ resume.docx
 *.resume.docx
 storage_state/
 .DS_Store
+
+# ZipRecruiter captured session (local backup — contains auth cookies)
+scripts/ziprecruiter_session_backup.json
