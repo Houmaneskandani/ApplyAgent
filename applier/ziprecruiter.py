@@ -80,8 +80,9 @@ async def apply_ziprecruiter(
         if user_info is not None:
             user_info["_reviewer_notes"] = (
                 "ZipRecruiter isn't connected. 1-Click Apply needs your logged-in "
-                "ZR session — run the one-time capture script (Profile → Connect "
-                "ZipRecruiter) and retry."
+                "ZR session. Run the one-time capture on your computer: "
+                "`cd job-bot && venv/bin/python scripts/capture_ziprecruiter_session.py`, "
+                "log in to ZipRecruiter, then retry this job."
             )
         return "failed"
 
