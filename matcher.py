@@ -39,11 +39,18 @@ ENGINEERING_TITLE_WORDS = [
 
 
 def is_engineering_job(title: str) -> bool:
-    """Return True if job title looks like a software/engineering role."""
+    """Return True if the title matches one of the ACTIVE job categories.
+
+    Defaults to software/engineering (so the matcher tests + historical
+    behavior are unchanged), but broadens to IT / DevOps / Data / etc. when
+    the scheduler has set active categories from users' preferences.
+    EXCLUDE_TITLE_WORDS (sales/marketing/PM/...) always win.
+    """
     t = title.lower()
     if any(w in t for w in EXCLUDE_TITLE_WORDS):
         return False
-    return any(w in t for w in ENGINEERING_TITLE_WORDS)
+    import job_categories
+    return any(w in t for w in job_categories.active_title_words())
 
 
 # ── Resume helpers ─────────────────────────────────────────────────────────
@@ -298,6 +305,25 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
         print(f"  ⚠ User {user_id} has no resume — AI will use profile info only")
 
     profile_summary = build_profile_summary(prefs, user, resume_text)
+
+    # If the user opted into job categories beyond what their résumé
+    # emphasizes (e.g. a software engineer also open to IT / DevOps roles),
+    # tell the scorer those areas are DESIRED — otherwise it rates them low on
+    # résumé-match alone and Auto Apply never queues them.
+    _cat_keys = (prefs or {}).get("job_categories") or []
+    if _cat_keys:
+        try:
+            import job_categories as _jc
+            _tlabels = _jc.labels(_cat_keys)
+            if _tlabels:
+                profile_summary += (
+                    "\n\nTARGET ROLE CATEGORIES (the candidate is ACTIVELY seeking "
+                    "these — score a job in ANY of these areas as a strong fit even "
+                    "if the résumé emphasizes a different area): "
+                    + ", ".join(_tlabels) + "."
+                )
+        except Exception:
+            pass
 
     print(f"  Scoring {len(jobs)} jobs for user {user_id}...")
 

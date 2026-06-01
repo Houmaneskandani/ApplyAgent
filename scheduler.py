@@ -234,6 +234,30 @@ async def run_scrape_and_score():
     from scrapers.ziprecruiter import scrape_ziprecruiter
     from db import get_pool
 
+    # Resolve which job categories to search + keep this cycle: the union of
+    # every user's preferences.job_categories. Drives the query-based scrapers
+    # AND matcher.is_engineering_job's title filter. Defaults to software
+    # engineering when nobody has configured categories.
+    try:
+        import job_categories as _jc
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            _rows = await conn.fetch("SELECT preferences FROM users")
+        _keys = set()
+        for _r in _rows:
+            _p = _r["preferences"]
+            if isinstance(_p, str):
+                try:
+                    _p = json.loads(_p)
+                except Exception:
+                    _p = {}
+            for _k in (_p or {}).get("job_categories", []) or []:
+                _keys.add(_k)
+        _jc.set_active(list(_keys))
+        print(f"[Scraper] Active job categories: {_jc.active_keys()}")
+    except Exception as _e:
+        print(f"[Scraper] category resolve failed (using default): {type(_e).__name__}: {_e}")
+
     scrapers = [
         ("Greenhouse",   scrape_greenhouse),
         ("Lever",        scrape_lever),
