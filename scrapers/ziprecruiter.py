@@ -30,7 +30,9 @@ ZR_QUERIES = [
 _SEARCH_URL = "https://www.ziprecruiter.com/jobs-search?search={kw}&location={loc}"
 
 _CHALLENGE_SIGNALS = ("press & hold", "press and hold", "verify you are a human",
-                      "are you a robot", "checking your browser")
+                      "are you a robot", "checking your browser",
+                      "just a moment", "performing security verification",
+                      "verifies you are not a bot", "cloudflare")
 
 
 def _strip_html(s: str) -> str:
