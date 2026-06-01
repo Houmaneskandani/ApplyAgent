@@ -42,6 +42,9 @@ os.makedirs("screenshots", exist_ok=True)
 APPLICATION_TIMEOUT = 240  # seconds — generous; ZR pages are heavy
 
 # Text signals that we landed on a bot-verification wall rather than the job.
+# ZipRecruiter fronts everything with CLOUDFLARE — its "Just a moment..." /
+# "Performing security verification" interstitial blocks headless/automated
+# browsers even with valid session cookies (cf_clearance is IP+UA+TLS bound).
 _CHALLENGE_SIGNALS = (
     "press & hold",
     "press and hold",
@@ -50,6 +53,14 @@ _CHALLENGE_SIGNALS = (
     "px-captcha",
     "/authn/login",  # bounced back to login = session not valid
     "checking your browser",
+    # Cloudflare managed-challenge interstitial:
+    "just a moment",
+    "performing security verification",
+    "verifies you are not a bot",
+    "verify you are not a bot",
+    "needs to review the security of your connection",
+    "cf-chl",
+    "cloudflare",
 )
 
 # Positive confirmation that the application actually went through.
