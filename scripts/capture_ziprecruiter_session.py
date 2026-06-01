@@ -79,11 +79,16 @@ def main():
     ap = argparse.ArgumentParser(description="Capture a ZipRecruiter login session for ApplyAgent.")
     ap.add_argument("--api", default=DEFAULT_API, help="ApplyAgent API base URL")
     ap.add_argument("--keep-open", action="store_true", help="leave the browser open after capture")
+    ap.add_argument("--upload", action="store_true",
+                    help="also upload via the ApplyAgent API (asks for your ApplyAgent login). "
+                         "Default OFF: just capture + save the file for direct ingestion.")
     args = ap.parse_args()
 
-    # Authorize the upload FIRST so we fail fast on bad ApplyAgent creds,
-    # before making the user sit through a ZR login.
-    token = _login_applyagent(args.api)
+    # By default we DON'T log in / upload — we just capture the session and
+    # save it locally. (Claude ingests the file straight into the DB, so no
+    # ApplyAgent password is needed and there's no HTTP failure mode.) Pass
+    # --upload for the self-serve API path.
+    token = _login_applyagent(args.api) if args.upload else None
 
     try:
         from playwright.sync_api import sync_playwright
@@ -169,7 +174,12 @@ def main():
     if n_cookies == 0:
         sys.exit("\n✗ No cookies captured — you weren't logged in. Re-run and log in first.")
 
-    _upload(args.api, token, ua, state)
+    if args.upload:
+        _upload(args.api, token, ua, state)
+    else:
+        print(f"\n✓ Session saved to:\n    {BACKUP_PATH}")
+        print("\n  → Go back to Claude and say \"captured\" — it'll ingest this file")
+        print("    straight into the database (no password needed).")
 
 
 if __name__ == "__main__":
