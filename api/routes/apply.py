@@ -7,6 +7,7 @@ from applier.ashby import apply_ashby
 from applier.smartrecruiters import apply_smartrecruiters
 from applier.workday import apply_workday
 from applier.generic import apply_generic
+from applier.ziprecruiter import apply_ziprecruiter
 import httpx
 import tempfile
 import json
@@ -188,7 +189,7 @@ async def get_user_info(user_id: int) -> dict:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT id, name, email, resume_url, preferences
+            SELECT id, name, email, resume_url, preferences, ziprecruiter_session
             FROM users WHERE id = $1
         """, user_id)
         if not row:
@@ -278,6 +279,20 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
             "imap_pass": _decrypt(prefs.get("imap_pass", "")),
         }
 
+        # ZipRecruiter 1-Click needs the user's logged-in session. Decrypt the
+        # stored blob ({"ua":..., "state":{...}}) into the short-lived
+        # user_info dict; the ZR applier replays it. None if not connected.
+        zr_raw = user.get("ziprecruiter_session")
+        if zr_raw:
+            try:
+                import json as _json
+                user_info["_ziprecruiter_session"] = _json.loads(_decrypt(zr_raw))
+            except Exception as _ze:
+                print(f"  ⚠ Could not decode ZipRecruiter session for user {user_id}: {type(_ze).__name__}")
+                user_info["_ziprecruiter_session"] = None
+        else:
+            user_info["_ziprecruiter_session"] = None
+
         # Read-and-clear the force_submit flag atomically. If the user
         # clicked "Submit anyway" on a reviewer-blocked apply, this run
         # bypasses the reviewer; the flag resets so a future normal retry
@@ -336,6 +351,11 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         elif source == "workday" or "myworkdayjobs.com" in url or "workday.com" in url:
             await _set_step(user_id, job_id, "Filling Workday form...")
             result = await apply_workday(
+                job, dry_run=dry_run, user_info=user_info, profile_text=profile_text
+            )
+        elif source == "ziprecruiter" or "ziprecruiter.com" in url:
+            await _set_step(user_id, job_id, "ZipRecruiter 1-Click Apply...")
+            result = await apply_ziprecruiter(
                 job, dry_run=dry_run, user_info=user_info, profile_text=profile_text
             )
         else:

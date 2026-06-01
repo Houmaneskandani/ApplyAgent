@@ -25,6 +25,8 @@ def classify_ats(source: str | None, url: str | None) -> str:
         return "smartrecruiters"
     if src == "workday" or "myworkdayjobs.com" in url_l or "workday.com" in url_l:
         return "workday"
+    if src == "ziprecruiter" or "ziprecruiter.com" in url_l:
+        return "ziprecruiter"
     return "generic"
 
 
@@ -112,7 +114,7 @@ async def get_jobs(
         user_id = int(user["user_id"])
         # SAFETY: validate `ats` against the known applier set so the
         # CASE-equality below never sees an attacker-controlled string.
-        VALID_ATS = {"greenhouse", "lever", "ashby", "workday", "smartrecruiters", "generic"}
+        VALID_ATS = {"greenhouse", "lever", "ashby", "workday", "smartrecruiters", "ziprecruiter", "generic"}
         ats_filter = ats if ats in VALID_ATS else None
 
         if ats_filter:
@@ -140,6 +142,8 @@ async def get_jobs(
                          WHEN j.source = 'workday'
                            OR j.url LIKE '%myworkdayjobs.com%'
                            OR j.url LIKE '%workday.com%' THEN 'workday'
+                         WHEN j.source = 'ziprecruiter'
+                           OR j.url LIKE '%ziprecruiter.com%' THEN 'ziprecruiter'
                          ELSE 'generic'
                        END = $4
                  ORDER BY a.score DESC
@@ -367,6 +371,9 @@ async def by_ats_with_samples(user=Depends(get_current_user)):
                           OR j.url LIKE '%myworkdayjobs.com%'
                           OR j.url LIKE '%workday.com%'
                             THEN 'workday'
+                        WHEN j.source = 'ziprecruiter'
+                          OR j.url LIKE '%ziprecruiter.com%'
+                            THEN 'ziprecruiter'
                         ELSE 'generic'
                     END AS ats
                   FROM jobs j

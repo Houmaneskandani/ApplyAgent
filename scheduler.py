@@ -231,17 +231,19 @@ async def run_scrape_and_score():
     from scrapers.ycombinator import scrape_ycombinator
     from scrapers.wellfound import scrape_wellfound
     from scrapers.jsearch import scrape_jsearch
+    from scrapers.ziprecruiter import scrape_ziprecruiter
     from db import get_pool
 
     scrapers = [
-        ("Greenhouse",  scrape_greenhouse),
-        ("Lever",       scrape_lever),
-        ("Himalayas",   scrape_himalayas),
-        ("Remotive",    scrape_remotive),
-        ("Dice",        scrape_dice),
-        ("YCombinator", scrape_ycombinator),
-        ("Wellfound",   scrape_wellfound),
-        ("JSearch",     scrape_jsearch),
+        ("Greenhouse",   scrape_greenhouse),
+        ("Lever",        scrape_lever),
+        ("Himalayas",    scrape_himalayas),
+        ("Remotive",     scrape_remotive),
+        ("Dice",         scrape_dice),
+        ("YCombinator",  scrape_ycombinator),
+        ("Wellfound",    scrape_wellfound),
+        ("JSearch",      scrape_jsearch),
+        ("ZipRecruiter", scrape_ziprecruiter),
     ]
 
     async def run_one(name, fn):

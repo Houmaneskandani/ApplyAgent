@@ -123,7 +123,7 @@ async def get_profile(user=Depends(get_current_user)):
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
-            SELECT id, name, email, resume_url, preferences
+            SELECT id, name, email, resume_url, preferences, ziprecruiter_session
             FROM users WHERE id = $1
         """, user["user_id"])
         if not row:
@@ -136,6 +136,9 @@ async def get_profile(user=Depends(get_current_user)):
         # memory. To rotate a saved secret the user types a new value and the
         # PUT merge logic encrypts + replaces.
         result["preferences"] = _strip_secret_prefs(prefs)
+        # ZipRecruiter session is an encrypted blob in its own column. NEVER
+        # return it — only a boolean so the UI can show "Connected".
+        result["ziprecruiter_session_set"] = bool(result.pop("ziprecruiter_session", None))
         return result
 
 
@@ -308,6 +311,66 @@ async def test_imap(request: Request, user=Depends(get_current_user)):
         # Don't leak full stack details to clients
         print(f"  ⚠ IMAP test failed for user {user['user_id']}: {e}")
         raise HTTPException(status_code=500, detail="IMAP connection failed")
+
+
+class ZipRecruiterSessionIn(BaseModel):
+    # Playwright storage_state captured from a real logged-in browser, plus
+    # the User-Agent it was issued to (clearance cookies are UA-bound, so the
+    # applier must replay this exact UA).
+    user_agent: str
+    storage_state: dict
+
+
+@router.post("/ziprecruiter-session")
+@_rate_limit("10/minute")
+async def save_ziprecruiter_session(
+    payload: ZipRecruiterSessionIn,
+    request: Request,
+    user=Depends(get_current_user),
+):
+    """Store a captured ZipRecruiter login session (Fernet-encrypted at rest).
+
+    The local capture script POSTs here after the user logs in once through a
+    headed browser. We store the storage_state + UA so the apply worker can
+    replay the authenticated session. SECURITY: the blob can contain auth
+    cookies — it is encrypted with the same key as imap_pass and is NEVER
+    returned by any GET (only a boolean `ziprecruiter_session_set`).
+    """
+    state = payload.storage_state or {}
+    # Validate it actually looks like a Playwright storage_state so we don't
+    # store junk that silently fails at apply time.
+    if not isinstance(state, dict) or not isinstance(state.get("cookies"), list) or not state["cookies"]:
+        raise HTTPException(
+            status_code=400,
+            detail="storage_state doesn't look valid (no cookies). Re-run the capture script after logging in.",
+        )
+    ua = (payload.user_agent or "").strip()
+    if not ua:
+        raise HTTPException(status_code=400, detail="user_agent is required (clearance cookies are UA-bound).")
+
+    blob = json.dumps({"ua": ua, "state": state})
+    encrypted = encrypt(blob)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET ziprecruiter_session = $1 WHERE id = $2",
+            encrypted, user["user_id"],
+        )
+    n_cookies = len(state["cookies"])
+    print(f"  ✓ ZipRecruiter session saved for user {user['user_id']} ({n_cookies} cookies)")
+    return {"ok": True, "cookies": n_cookies, "message": "ZipRecruiter session connected."}
+
+
+@router.delete("/ziprecruiter-session")
+async def clear_ziprecruiter_session(user=Depends(get_current_user)):
+    """Disconnect ZipRecruiter (clear the stored session)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET ziprecruiter_session = NULL WHERE id = $1",
+            user["user_id"],
+        )
+    return {"ok": True, "message": "ZipRecruiter disconnected."}
 
 
 @router.post("/rescore")
