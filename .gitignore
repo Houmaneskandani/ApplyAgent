@@ -18,3 +18,4 @@ storage_state/
 
 # ZipRecruiter captured session (local backup — contains auth cookies)
 scripts/ziprecruiter_session_backup.json
+scripts/.zr_chrome_profile/

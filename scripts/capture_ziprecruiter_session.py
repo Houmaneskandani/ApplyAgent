@@ -94,12 +94,41 @@ def main():
         # HEADED so you can actually log in (and solve any human-verification
         # challenge yourself). We do NOT override the UA — we capture whatever
         # this real browser reports, then the applier replays exactly that.
-        try:
-            browser = p.chromium.launch(headless=False)
-        except Exception as e:
-            sys.exit(f"✗ Could not launch Chromium: {e}\n  Try: venv/bin/python -m playwright install chromium")
-        context = browser.new_context()
-        page = context.new_page()
+        #
+        # CRITICAL: use your REAL installed Google Chrome (channel="chrome"),
+        # not Playwright's bundled Chromium. ZipRecruiter's bot wall
+        # (PerimeterX/HUMAN) fingerprints Chromium and loops "verify you are
+        # human" forever even when a human solves it. Real Chrome +
+        # --disable-blink-features=AutomationControlled (drops the
+        # navigator.webdriver tell) sails past it. We fall back to bundled
+        # Chromium only if Chrome isn't installed.
+        profile_dir = os.path.join(os.path.dirname(__file__), ".zr_chrome_profile")
+        launch_common = dict(
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = None
+        last_err = None
+        for kwargs in ({"channel": "chrome", **launch_common}, dict(launch_common)):
+            try:
+                # Persistent context = a real on-disk Chrome profile, so you
+                # only have to clear the wall once and the fingerprint stays
+                # consistent across runs.
+                context = p.chromium.launch_persistent_context(profile_dir, **kwargs)
+                using = "Google Chrome" if kwargs.get("channel") == "chrome" else "bundled Chromium"
+                print(f"  (launched {using})")
+                break
+            except Exception as e:
+                last_err = e
+        if context is None:
+            sys.exit(f"✗ Could not launch a browser: {last_err}\n"
+                     f"  If you don't have Chrome: venv/bin/python -m playwright install chromium")
+
+        # Belt-and-suspenders: hide the automation tell at the JS layer too.
+        context.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});"
+        )
+        page = context.pages[0] if context.pages else context.new_page()
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
         print("\n" + "=" * 64)
@@ -117,7 +146,7 @@ def main():
             print("\n  ⚠ The browser is still on the login page. If you're not actually")
             print("    logged in, the captured session won't work.")
             if input("    Capture anyway? [y/N]: ").strip().lower() != "y":
-                browser.close()
+                context.close()
                 sys.exit("  Aborted — re-run when you're logged in.")
 
         ua = page.evaluate("() => navigator.userAgent")
@@ -125,7 +154,7 @@ def main():
         n_cookies = len(state.get("cookies", []))
 
         if not args.keep_open:
-            browser.close()
+            context.close()
 
     # Local encrypted-at-rest? No — backup is plaintext on YOUR machine only.
     # It's gitignored; delete after upload. The SERVER copy is Fernet-encrypted.
