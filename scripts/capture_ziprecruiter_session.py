@@ -82,7 +82,24 @@ def main():
     ap.add_argument("--upload", action="store_true",
                     help="also upload via the ApplyAgent API (asks for your ApplyAgent login). "
                          "Default OFF: just capture + save the file for direct ingestion.")
+    ap.add_argument("--proxy", default="",
+                    help="Residential proxy URL (scheme://user:pass@host:port) to capture "
+                         "THROUGH — must be the SAME static/sticky IP the applies will use, "
+                         "so Cloudflare's IP-bound clearance validates.")
     args = ap.parse_args()
+
+    def _parse_proxy(url):
+        url = (url or "").strip()
+        if not url:
+            return None
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        cfg = {"server": f"{u.scheme}://{u.hostname}" + (f":{u.port}" if u.port else "")}
+        if u.username: cfg["username"] = u.username
+        if u.password: cfg["password"] = u.password
+        return cfg
+
+    proxy_cfg = _parse_proxy(args.proxy)
 
     # By default we DON'T log in / upload — we just capture the session and
     # save it locally. (Claude ingests the file straight into the DB, so no
@@ -112,22 +129,33 @@ def main():
             headless=False,
             args=["--disable-blink-features=AutomationControlled"],
         )
+        if proxy_cfg:
+            launch_common["proxy"] = proxy_cfg
+            print(f"  (capturing through proxy {proxy_cfg['server']})")
         context = None
         last_err = None
-        for kwargs in ({"channel": "chrome", **launch_common}, dict(launch_common)):
+        # Prefer a REAL installed browser (clean fingerprint that clears
+        # Cloudflare/PerimeterX); bundled Chromium is the last resort and tends
+        # to loop the wall. Order: Chrome → Edge (msedge) → bundled Chromium.
+        attempts = [
+            {"channel": "chrome", **launch_common},
+            {"channel": "msedge", **launch_common},
+            dict(launch_common),
+        ]
+        for kwargs in attempts:
             try:
-                # Persistent context = a real on-disk Chrome profile, so you
-                # only have to clear the wall once and the fingerprint stays
-                # consistent across runs.
+                # Persistent context = a real on-disk profile, so you only have
+                # to clear the wall once and the fingerprint stays consistent.
                 context = p.chromium.launch_persistent_context(profile_dir, **kwargs)
-                using = "Google Chrome" if kwargs.get("channel") == "chrome" else "bundled Chromium"
+                ch = kwargs.get("channel")
+                using = {"chrome": "Google Chrome", "msedge": "Microsoft Edge"}.get(ch, "bundled Chromium")
                 print(f"  (launched {using})")
                 break
             except Exception as e:
                 last_err = e
         if context is None:
             sys.exit(f"✗ Could not launch a browser: {last_err}\n"
-                     f"  If you don't have Chrome: venv/bin/python -m playwright install chromium")
+                     f"  If you have none of Chrome/Edge: venv/bin/python -m playwright install chromium")
 
         # Belt-and-suspenders: hide the automation tell at the JS layer too.
         context.add_init_script(
