@@ -193,28 +193,10 @@ def _random_fingerprint() -> dict:
     }
 
 
-def _proxy_config() -> dict | None:
-    """
-    Read proxy config from env. Returns None if not configured.
-
-    Supports a single proxy or a comma-separated list (one is picked at
-    random per launch). Format: scheme://user:pass@host:port
-
-      PROXY_URL=http://user:pass@proxy.example.com:8000
-      PROXY_URLS=http://u:p@h1:8000,http://u:p@h2:8000
-
-    For residential rotating providers (Bright Data / IPRoyal / Smartproxy),
-    the gateway URL is typically all you need — the provider handles rotation.
-    """
-    pool = os.getenv("PROXY_URLS", "").strip()
-    if pool:
-        choices = [p.strip() for p in pool.split(",") if p.strip()]
-        if choices:
-            url = random.choice(choices)
-        else:
-            url = ""
-    else:
-        url = os.getenv("PROXY_URL", "").strip()
+def parse_proxy_url(url: str) -> dict | None:
+    """Parse a scheme://user:pass@host:port proxy URL into Playwright's proxy
+    dict ({server, username?, password?}). Returns None for empty input."""
+    url = (url or "").strip()
     if not url:
         return None
     parsed = urlparse(url)
@@ -227,6 +209,33 @@ def _proxy_config() -> dict | None:
     if parsed.password:
         cfg["password"] = parsed.password
     return cfg
+
+
+def _proxy_config() -> dict | None:
+    """
+    Read the GLOBAL proxy config from env. Returns None if not configured.
+
+    Supports a single proxy or a comma-separated list (one is picked at
+    random per launch). Format: scheme://user:pass@host:port
+
+      PROXY_URL=http://user:pass@proxy.example.com:8000
+      PROXY_URLS=http://u:p@h1:8000,http://u:p@h2:8000
+
+    For residential rotating providers (Bright Data / IPRoyal / Smartproxy),
+    the gateway URL is typically all you need — the provider handles rotation.
+
+    NOTE: a per-applier override (e.g. ZIPRECRUITER_PROXY_URL, passed via
+    stealth_session(proxy_override=...)) takes precedence over this global one,
+    so you can route ONLY the Cloudflare-walled ATS through metered
+    residential bandwidth instead of every applier.
+    """
+    pool = os.getenv("PROXY_URLS", "").strip()
+    if pool:
+        choices = [p.strip() for p in pool.split(",") if p.strip()]
+        url = random.choice(choices) if choices else ""
+    else:
+        url = os.getenv("PROXY_URL", "").strip()
+    return parse_proxy_url(url)
 
 
 async def _apply_stealth(page) -> None:
@@ -256,6 +265,7 @@ async def stealth_session(
     persist_state: bool = True,
     storage_state_override: dict | None = None,
     user_agent_override: str | None = None,
+    proxy_override: str | dict | None = None,
 ):
     """
     The new high-level browser entry point. Yields (browser, context, page)
@@ -282,7 +292,12 @@ async def stealth_session(
     # captured session we MUST reuse that UA or the session gets challenged.
     if user_agent_override:
         fp["user_agent"] = user_agent_override
-    proxy = _proxy_config()
+    # A per-call proxy override (e.g. a residential proxy for ZipRecruiter)
+    # wins over the global PROXY_URL/PROXY_URLS env config.
+    if proxy_override:
+        proxy = proxy_override if isinstance(proxy_override, dict) else parse_proxy_url(proxy_override)
+    else:
+        proxy = _proxy_config()
 
     launch_kwargs = {
         "headless": _headless_mode(),

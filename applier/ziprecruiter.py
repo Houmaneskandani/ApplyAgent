@@ -101,6 +101,14 @@ async def apply_ziprecruiter(
     state = sess["state"]
     job_id = job.get("id", "unknown")
 
+    # Residential proxy for the Cloudflare wall. Prefer a ZR-specific proxy so
+    # only this ATS burns metered residential bandwidth; fall back to the
+    # global PROXY_URL. For clearance to validate, this should be the SAME
+    # (static/sticky) IP the session was captured through.
+    zr_proxy = os.getenv("ZIPRECRUITER_PROXY_URL") or os.getenv("PROXY_URL") or None
+    if zr_proxy:
+        print(f"    → routing through residential proxy {zr_proxy.split('@')[-1][:40]}")
+
     try:
         async with async_playwright() as p:
             async with stealth_session(
@@ -110,6 +118,7 @@ async def apply_ziprecruiter(
                 persist_state=False,             # session comes from DB, not FS
                 storage_state_override=state,    # replay the captured cookies
                 user_agent_override=ua,          # ...with the UA they were issued to
+                proxy_override=zr_proxy,         # ...through the same residential IP
             ) as (_browser, _context, page):
                 try:
                     await page.goto(job["url"], timeout=60000, wait_until="domcontentloaded")
