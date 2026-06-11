@@ -173,8 +173,16 @@ Languages: {', '.join(l if isinstance(l, str) else l.get('name','') for l in lan
 
 # ── AI scoring ─────────────────────────────────────────────────────────────
 
-async def ai_score_job(job: dict, profile_summary: str, years_experience: str = "") -> int:
-    """Use Claude Haiku to score job-resume fit 0-10."""
+async def ai_score_job(job: dict, profile_summary: str, years_experience: str = "",
+                       open_to_lower_level: bool = False) -> int:
+    """Use Claude Haiku to score job-resume fit 0-10.
+
+    open_to_lower_level: when True, the candidate is deliberately willing to
+    take roles BELOW their experience level (e.g. a senior engineer also
+    seeking entry IT / help desk / junior DevOps). We then stop penalizing
+    'over-qualification' / seniority mismatch — otherwise those roles score
+    below the auto-apply threshold and never get applied to.
+    """
     title = job.get("title", "Unknown")
     company = job.get("company", "Unknown")
     description = (job.get("description", "") or "")[:2000]
@@ -205,6 +213,18 @@ async def ai_score_job(job: dict, profile_summary: str, years_experience: str = 
     else:
         seniority_note = "- Seniority unknown — judge fit from the rest of the profile/resume only."
 
+    # When the candidate has opted into lower-level roles, override the
+    # seniority guidance entirely — over-qualification is NOT a negative here.
+    if open_to_lower_level:
+        seniority_note = (
+            "- The candidate is ACTIVELY OPEN to roles BELOW their experience level "
+            "(e.g. entry/junior IT support, help desk, desktop support, junior DevOps, "
+            "data/analytics). Do NOT penalize 'overqualification' or seniority mismatch — "
+            "they WANT these roles. An experienced person applying to a lower-level role "
+            "they can clearly do is a STRONG fit. Judge on: (a) can they do the job, and "
+            "(b) is it in one of their target areas — NOT on whether the level matches."
+        )
+
     prompt = f"""Rate how well this job matches this candidate. Reply with ONE integer 0-10.
 
 {profile_summary}
@@ -217,9 +237,10 @@ DESCRIPTION:
 Scoring rules:
 9-10 = Excellent — most required skills match at the right level, good seniority fit
 7-8  = Good — core skills match, minor gaps
-5-6  = Partial — related field but missing key skills or wrong seniority
-3-4  = Weak — different tech stack or off-target seniority
+5-6  = Partial — related field but missing key skills{"" if open_to_lower_level else " or wrong seniority"}
+3-4  = Weak — different tech stack{"" if open_to_lower_level else " or off-target seniority"}
 0-2  = Poor — wrong domain entirely
+{("OVERRIDE — the candidate opted into lower-level roles: do NOT use 'wrong/off-target seniority' as a downgrade. A role they can clearly do in a target area scores 8-9 even if it's below their level." ) if open_to_lower_level else ""}
 
 Seniority guidance:
 {seniority_note}
@@ -332,6 +353,13 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     # The internal retry logic in ai_score_job handles transient 429s.
     SCORE_CONCURRENCY = int(os.getenv("MATCHER_CONCURRENCY", "5"))
     yrs_exp = prefs.get("years_experience", "")
+    # When the user opts into lower-level roles, the scorer stops penalizing
+    # over-qualification so entry/junior IT/DevOps/Data jobs can clear the
+    # auto-apply threshold. Auto-on if they've chosen any non-SWE category.
+    open_low = bool(prefs.get("open_to_lower_level"))
+    if not open_low:
+        _cats = prefs.get("job_categories") or []
+        open_low = any(c != "software_engineering" for c in _cats)
     sem = asyncio.Semaphore(SCORE_CONCURRENCY)
 
     counters = {"scored": 0, "errored": 0, "skipped": 0}
@@ -345,7 +373,10 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
             counters["skipped"] += 1
             return
         async with sem:
-            score, errored = await ai_score_job(job_dict, profile_summary, years_experience=yrs_exp)
+            score, errored = await ai_score_job(
+                job_dict, profile_summary, years_experience=yrs_exp,
+                open_to_lower_level=open_low,
+            )
         if errored:
             # API error / parse failure / rate-limit-give-up. Do NOT write the
             # safety-net 5 — get_unscored_jobs only re-picks rows with score
