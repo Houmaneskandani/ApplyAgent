@@ -346,18 +346,20 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
             return
         async with sem:
             score, errored = await ai_score_job(job_dict, profile_summary, years_experience=yrs_exp)
-        await upsert_application(user_id, job_dict["id"], score)
         if errored:
-            # API error / parse failure / rate-limit-give-up. We still wrote
-            # the safety-net 5 to the DB so the job has SOME score, but it's
-            # not a real signal — don't count it as a successful score.
+            # API error / parse failure / rate-limit-give-up. Do NOT write the
+            # safety-net 5 — get_unscored_jobs only re-picks rows with score
+            # IS NULL, so a written 5 would brand the job permanently (one
+            # below the apply threshold) with no retry path. Leaving it
+            # unscored lets the next scrape cycle try again.
             counters["errored"] += 1
-        else:
-            counters["scored"] += 1
-            if score >= 7:
-                print(f"  [{score}/10] ✓ {title} @ {job_dict.get('company', '')}")
-            elif score <= 3:
-                print(f"  [{score}/10] ✗ {title} @ {job_dict.get('company', '')}")
+            return
+        await upsert_application(user_id, job_dict["id"], score)
+        counters["scored"] += 1
+        if score >= 7:
+            print(f"  [{score}/10] ✓ {title} @ {job_dict.get('company', '')}")
+        elif score <= 3:
+            print(f"  [{score}/10] ✗ {title} @ {job_dict.get('company', '')}")
 
     # Run all scoring tasks concurrently. asyncio.gather preserves order on
     # return but we don't care — each task writes to the DB independently.

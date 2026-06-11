@@ -138,6 +138,10 @@ DOMAIN_JITTER_MIN = float(os.getenv("DOMAIN_JITTER_MIN_SEC", "15"))
 DOMAIN_JITTER_MAX = float(os.getenv("DOMAIN_JITTER_MAX_SEC", "60"))
 
 _domain_locks: dict[str, asyncio.Semaphore] = {}
+# Strong refs to in-flight cooldown tasks. asyncio only weak-refs the result of
+# create_task, so without this set a cooldown task can be GC'd before it runs —
+# and then sem.release() never fires, permanently deadlocking that domain.
+_cooldown_tasks: set = set()
 
 
 def _get_domain_semaphore(netloc: str) -> asyncio.Semaphore:
@@ -175,7 +179,9 @@ async def throttle_for_url(url: str):
                 await asyncio.sleep(random.uniform(DOMAIN_JITTER_MIN, DOMAIN_JITTER_MAX))
             finally:
                 sem.release()
-        asyncio.create_task(_cooldown())
+        t = asyncio.create_task(_cooldown())
+        _cooldown_tasks.add(t)
+        t.add_done_callback(_cooldown_tasks.discard)
 
 
 # ─── Browser launch & context creation ────────────────────────────────
@@ -308,61 +314,67 @@ async def stealth_session(
 
     browser = await playwright.chromium.launch(**launch_kwargs)
 
-    context_kwargs = {
-        "user_agent": fp["user_agent"],
-        "viewport": fp["viewport"],
-        "screen": fp["screen"],
-        "locale": fp["locale"],
-        "timezone_id": fp["timezone_id"],
-        # Real browsers report multiple languages; the first is the primary.
-        "extra_http_headers": {
-            "Accept-Language": f"{fp['locale']},en;q=0.9",
-        },
-    }
-
-    # An explicit override (e.g. a ZipRecruiter session loaded from the DB)
-    # wins over the per-user FS cache. We do NOT fall back to the FS read when
-    # an override is supplied — the caller is being deliberate about identity.
-    state = storage_state_override or (
-        _read_storage_state(user_id, url) if (persist_state and url) else None
-    )
-    if state:
-        context_kwargs["storage_state"] = state
-
-    context = await browser.new_context(**context_kwargs)
-
-    # Realistic navigator overrides. playwright-stealth handles most of these,
-    # but adding init_script gives us belt-and-suspenders coverage if stealth
-    # is broken or removed.
-    await context.add_init_script("""
-        // navigator.webdriver should be undefined, not false (false reveals automation).
-        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        // Real browsers advertise multiple languages.
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        // 4 is a common, plausible value across consumer hardware.
-        try {
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-        } catch (_) {}
-        // Mock chrome.runtime presence (real Chrome has it; HeadlessChrome historically didn't).
-        if (!window.chrome) window.chrome = { runtime: {} };
-    """)
-
-    page = await context.new_page()
-    await _apply_stealth(page)
-
+    # CRITICAL: everything after launch() goes inside try/finally. If
+    # new_context / add_init_script / new_page throws (e.g. a corrupt
+    # storage_state), the Chromium process must still be closed — otherwise it
+    # leaks on every apply until the container OOMs.
+    context = None
+    page = None
     try:
+        context_kwargs = {
+            "user_agent": fp["user_agent"],
+            "viewport": fp["viewport"],
+            "screen": fp["screen"],
+            "locale": fp["locale"],
+            "timezone_id": fp["timezone_id"],
+            # Real browsers report multiple languages; the first is the primary.
+            "extra_http_headers": {
+                "Accept-Language": f"{fp['locale']},en;q=0.9",
+            },
+        }
+
+        # An explicit override (e.g. a ZipRecruiter session loaded from the DB)
+        # wins over the per-user FS cache. We do NOT fall back to the FS read
+        # when an override is supplied — the caller is deliberate about identity.
+        state = storage_state_override or (
+            _read_storage_state(user_id, url) if (persist_state and url) else None
+        )
+        if state:
+            context_kwargs["storage_state"] = state
+
+        context = await browser.new_context(**context_kwargs)
+
+        # Realistic navigator overrides. playwright-stealth handles most of
+        # these, but the init_script is belt-and-suspenders if stealth breaks.
+        await context.add_init_script("""
+            // navigator.webdriver should be undefined, not false (false reveals automation).
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            // Real browsers advertise multiple languages.
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            // 4 is a common, plausible value across consumer hardware.
+            try {
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            } catch (_) {}
+            // Mock chrome.runtime presence (real Chrome has it; HeadlessChrome historically didn't).
+            if (!window.chrome) window.chrome = { runtime: {} };
+        """)
+
+        page = await context.new_page()
+        await _apply_stealth(page)
+
         yield browser, context, page
     finally:
-        # Persist storage state before tearing down.
-        if persist_state and url:
+        # Persist storage state before tearing down (only if context survived).
+        if persist_state and url and context is not None:
             try:
                 await _write_storage_state(context, user_id, url)
             except Exception:
                 pass
-        try:
-            await context.close()
-        except Exception:
-            pass
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
         try:
             await browser.close()
         except Exception:
