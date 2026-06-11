@@ -2,7 +2,12 @@
 builder = "dockerfile"
 
 [deploy]
-startCommand = "uvicorn api.main:app --host 0.0.0.0 --port 8000"
+# --proxy-headers + --forwarded-allow-ips='*' so uvicorn trusts Railway's
+# X-Forwarded-For and the slowapi rate limiter keys on the REAL client IP.
+# Without it every client shares Railway's proxy IP, so one attacker can
+# exhaust the /auth limits and lock out everyone (and brute-force isolation
+# is void).
+startCommand = "uvicorn api.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips='*'"
 # Real liveness check — verifies DB connectivity, not just that the
 # Python process is running.
 healthcheckPath = "/health"
