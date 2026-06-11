@@ -4,6 +4,19 @@ import json
 DAILY_LIMIT = 10
 MIN_SCORE = 6  # bot won't auto-apply to anything weaker than this
 
+# asyncio.create_task returns a task the loop only holds a WEAK reference to —
+# if we don't keep our own reference it can be garbage-collected mid-flight
+# (and silently never finish). Keep a strong ref until the task completes.
+_bg_tasks: set = set()
+
+
+def _spawn(coro):
+    """Fire-and-forget a coroutine while keeping a strong reference."""
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
+
 
 def _job_passes_saved_filters(job: dict, filters: dict) -> bool:
     """
@@ -115,88 +128,91 @@ async def auto_apply_for_user(user_id: int) -> int:
          the saved filters.
     """
     from db import get_pool, add_to_queue
+    from api.routes.queue import process_user_queue
     pool = await get_pool()
-    async with pool.acquire() as conn:
-        applied_today = await conn.fetchval("""
-            SELECT COUNT(*) FROM applications
-            WHERE user_id = $1 AND status = 'applied' AND dry_run = false
-            AND applied_at >= CURRENT_DATE
-        """, user_id)
 
-        in_progress = await conn.fetchval("""
-            SELECT COUNT(*) FROM applications
-            WHERE user_id = $1 AND status IN ('queued', 'applying')
-        """, user_id)
+    async def _decide_and_queue() -> int:
+        async with pool.acquire() as conn:
+            applied_today = await conn.fetchval("""
+                SELECT COUNT(*) FROM applications
+                WHERE user_id = $1 AND status = 'applied' AND dry_run = false
+                AND applied_at >= CURRENT_DATE
+            """, user_id)
 
-        remaining = DAILY_LIMIT - int(applied_today or 0) - int(in_progress or 0)
-        if remaining <= 0:
-            print(f"  [AutoApply] User {user_id}: daily limit reached "
-                  f"({applied_today}/{DAILY_LIMIT} applied, {in_progress} in progress)")
+            in_progress = await conn.fetchval("""
+                SELECT COUNT(*) FROM applications
+                WHERE user_id = $1 AND status IN ('queued', 'applying')
+            """, user_id)
+
+            remaining = DAILY_LIMIT - int(applied_today or 0) - int(in_progress or 0)
+            if remaining <= 0:
+                print(f"  [AutoApply] User {user_id}: daily limit reached "
+                      f"({applied_today}/{DAILY_LIMIT} applied, {in_progress} in progress)")
+                return 0
+
+            user_row = await conn.fetchrow(
+                "SELECT preferences FROM users WHERE id = $1", user_id,
+            )
+            prefs_raw = user_row["preferences"] if user_row else {}
+            if isinstance(prefs_raw, str):
+                try:
+                    prefs_raw = json.loads(prefs_raw)
+                except Exception:
+                    prefs_raw = {}
+            filters = (prefs_raw or {}).get("dashboard_filters") or {}
+
+            pool_size = max(remaining * 5, 30)
+            candidates = await conn.fetch("""
+                SELECT a.job_id, a.score,
+                       j.title, j.company, j.location, j.description
+                  FROM applications a
+                  JOIN jobs j ON j.id = a.job_id
+                 WHERE a.user_id = $1 AND a.status = 'new' AND a.score >= $2
+                 ORDER BY a.score DESC
+                 LIMIT $3
+            """, user_id, MIN_SCORE, pool_size)
+
+        if not candidates:
+            print(f"  [AutoApply] User {user_id}: no qualifying new jobs (score >= {MIN_SCORE}, status = new)")
             return 0
 
-        # Read saved filters from user.preferences.dashboard_filters
-        user_row = await conn.fetchrow(
-            "SELECT preferences FROM users WHERE id = $1", user_id,
+        matching: list = []
+        for job in candidates:
+            if _job_passes_saved_filters(dict(job), filters):
+                matching.append(job)
+                if len(matching) >= remaining:
+                    break
+
+        if not matching:
+            active_filter_keys = [k for k, v in filters.items() if v and v != [] and v != ""]
+            print(
+                f"  [AutoApply] User {user_id}: {len(candidates)} candidates "
+                f"in pool, 0 passed saved filters {active_filter_keys}"
+            )
+            return 0
+
+        filter_note = (
+            f" (filtered to {len(matching)} from {len(candidates)} candidates)"
+            if filters else ""
         )
-        prefs_raw = user_row["preferences"] if user_row else {}
-        if isinstance(prefs_raw, str):
-            try:
-                prefs_raw = json.loads(prefs_raw)
-            except Exception:
-                prefs_raw = {}
-        filters = (prefs_raw or {}).get("dashboard_filters") or {}
-
-        # Fetch wider pool than `remaining` so we have material after
-        # filters. 5x is a reasonable ratio — if even that isn't enough,
-        # the user's filters are probably too strict and there's nothing
-        # left to apply to (which is fine; we just queue fewer).
-        pool_size = max(remaining * 5, 30)
-        candidates = await conn.fetch("""
-            SELECT a.job_id, a.score,
-                   j.title, j.company, j.location, j.description
-              FROM applications a
-              JOIN jobs j ON j.id = a.job_id
-             WHERE a.user_id = $1 AND a.status = 'new' AND a.score >= $2
-             ORDER BY a.score DESC
-             LIMIT $3
-        """, user_id, MIN_SCORE, pool_size)
-
-    if not candidates:
-        print(f"  [AutoApply] User {user_id}: no qualifying new jobs (score >= {MIN_SCORE}, status = new)")
-        return 0
-
-    matching: list = []
-    for job in candidates:
-        if _job_passes_saved_filters(dict(job), filters):
-            matching.append(job)
-            if len(matching) >= remaining:
-                break
-
-    if not matching:
-        # Filters in place but nothing in the pool matches. Worth logging
-        # so we can tell from the worker logs whether the user's filters
-        # are accidentally too narrow.
-        active_filter_keys = [k for k, v in filters.items() if v and v != [] and v != ""]
         print(
-            f"  [AutoApply] User {user_id}: {len(candidates)} candidates "
-            f"in pool, 0 passed saved filters {active_filter_keys}"
+            f"  [AutoApply] User {user_id}: queuing {len(matching)} job(s)"
+            f"{filter_note} — {applied_today} applied today, {remaining} remaining"
         )
-        return 0
+        for job in matching:
+            await add_to_queue(user_id, job["job_id"], dry_run=False)
+        return len(matching)
 
-    filter_note = (
-        f" (filtered to {len(matching)} from {len(candidates)} candidates)"
-        if filters else ""
-    )
-    print(
-        f"  [AutoApply] User {user_id}: queuing {len(matching)} job(s)"
-        f"{filter_note} — {applied_today} applied today, {remaining} remaining"
-    )
-    for job in matching:
-        await add_to_queue(user_id, job["job_id"], dry_run=False)
-
-    from api.routes.queue import process_user_queue
-    asyncio.create_task(process_user_queue(user_id))
-    return len(matching)
+    try:
+        return await _decide_and_queue()
+    finally:
+        # ALWAYS kick the queue drainer for this user — on EVERY exit path
+        # (limit reached, no candidates, no matches, success, OR exception).
+        # This drains both rows we just queued AND any stranded in 'queued'
+        # from a prior crash/early-return. Without it, a stopped queue never
+        # restarts until a manual /apply click (the bug that froze the queue
+        # for ~47h). `process_user_queue` is a no-op if already draining.
+        _spawn(process_user_queue(user_id))
 
 
 async def run_auto_apply():
@@ -281,7 +297,55 @@ async def run_scrape_and_score():
 
     print("\n[Scraper] Starting scrape (all sources in parallel)...")
     results = await asyncio.gather(*[run_one(n, f) for n, f in scrapers])
-    print(f"[Scraper] Done — {sum(results)} total jobs scraped. (Scoring runs on-demand.)")
+    print(f"[Scraper] Done — {sum(results)} total jobs scraped.")
+
+    # Score the freshly-scraped jobs for every user, otherwise they keep
+    # score=NULL and can never satisfy the auto-apply score>=6 bar. (This was
+    # the missing step that made scheduler-scraped jobs un-auto-appliable.)
+    from matcher import score_jobs
+    async with pool.acquire() as conn:
+        users = await conn.fetch("SELECT id FROM users")
+    print(f"[Scraper] Scoring for {len(users)} user(s)...")
+    for u in users:
+        try:
+            await score_jobs(u["id"])
+        except Exception as e:
+            print(f"  [Scraper] scoring user {u['id']} failed: {type(e).__name__}: {e}")
+
+
+async def auto_apply_loop():
+    """
+    Long-running auto-apply + queue-drain loop for the API service.
+
+    Decoupled from scrape+score (the cron worker does that), so it runs
+    cheaply in the web process even when RUN_SCHEDULER_IN_WEB is off — this is
+    what actually drains the queue and submits applications. Also recovers any
+    rows stranded in 'queued' by a prior restart, on boot.
+    """
+    print("[AutoApplyLoop] Started")
+    from db import get_pool
+    from api.routes.queue import process_user_queue
+    # Boot recovery: kick a drainer for every user with leftover 'queued' rows.
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT DISTINCT user_id FROM applications WHERE status = 'queued'"
+            )
+        for r in rows:
+            _spawn(process_user_queue(r["user_id"]))
+        if rows:
+            print(f"[AutoApplyLoop] Boot: drained {len(rows)} user(s) with stranded queue rows")
+    except Exception as e:
+        print(f"[AutoApplyLoop] boot drain failed: {type(e).__name__}: {e}")
+    # Periodic: queue fresh matches + drain. 20 min keeps it responsive without
+    # hammering the DB.
+    while True:
+        await asyncio.sleep(1200)
+        try:
+            await run_auto_apply()
+        except Exception as e:
+            print(f"[AutoApplyLoop] error: {type(e).__name__}: {e}")
 
 
 async def scheduler_loop():
@@ -293,4 +357,4 @@ async def scheduler_loop():
         await run_auto_apply()
         scrape_counter += 1
         if scrape_counter % 6 == 0:
-            asyncio.create_task(run_scrape_and_score())
+            _spawn(run_scrape_and_score())
