@@ -50,7 +50,11 @@ async def init_db():
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS resume_url TEXT")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMP")
-        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credits FLOAT DEFAULT 100")
+        # Default free credits for new signups. Kept modest (25 ≈ 60 applies)
+        # to limit throwaway-email farming until email verification lands.
+        # Existing users keep whatever balance they already have.
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS credits FLOAT DEFAULT 25")
+        await conn.execute("ALTER TABLE users ALTER COLUMN credits SET DEFAULT 25")
         # ZipRecruiter 1-Click Apply submits through the user's logged-in ZR
         # account — there's no anonymous form. We store the captured browser
         # session (Playwright storage_state + the UA it was issued to) here,

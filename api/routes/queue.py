@@ -1,6 +1,6 @@
 import asyncio
-from fastapi import APIRouter, Depends, HTTPException
-from api.auth import get_current_user
+from fastapi import APIRouter, Depends, HTTPException, Request
+from api.auth import get_current_user, _rate_limit
 from db import get_pool
 from applier.browser_utils import throttle_for_url
 
@@ -180,7 +180,8 @@ async def get_queue(user=Depends(get_current_user)):
 
 
 @router.post("/trigger-scrape")
-async def trigger_scrape(user=Depends(get_current_user)):
+@_rate_limit("3/minute")
+async def trigger_scrape(request: Request, user=Depends(get_current_user)):
     """Manually trigger a scrape then score up to 100 new jobs for this user."""
     async def _run(user_id: int):
         from scheduler import run_scrape_and_score

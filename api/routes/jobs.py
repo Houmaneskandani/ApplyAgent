@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends, BackgroundTasks
-from api.auth import get_current_user
+from fastapi import APIRouter, Depends, BackgroundTasks, Request
+from api.auth import get_current_user, _rate_limit
 from db import get_pool
 
 router = APIRouter()
@@ -427,7 +427,8 @@ async def by_ats_with_samples(user=Depends(get_current_user)):
 
 
 @router.post("/scrape")
-async def trigger_scrape(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+@_rate_limit("3/minute")
+async def trigger_scrape(request: Request, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     """Kick off a full scrape + rescore in the background."""
     user_id = user["user_id"]
 

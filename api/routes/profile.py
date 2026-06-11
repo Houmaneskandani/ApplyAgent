@@ -374,7 +374,8 @@ async def clear_ziprecruiter_session(user=Depends(get_current_user)):
 
 
 @router.post("/rescore")
-async def rescore_jobs(background_tasks: BackgroundTasks, user=Depends(get_current_user)):
+@_rate_limit("3/minute")
+async def rescore_jobs(request: Request, background_tasks: BackgroundTasks, user=Depends(get_current_user)):
     """Rescore all jobs based on updated profile preferences."""
     background_tasks.add_task(score_jobs, user["user_id"])
     return {"status": "rescoring started"}
