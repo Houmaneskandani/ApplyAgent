@@ -60,12 +60,22 @@ RUN_SCHEDULER_IN_WEB = os.getenv("RUN_SCHEDULER_IN_WEB", "0") == "1"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = None
+    tasks = []
+    # ALWAYS run the auto-apply + queue-drain loop in the (long-running) web
+    # service. Applies are long Playwright sessions that can only complete in a
+    # persistent process — the short-lived cron worker can't run them. This is
+    # cheap (no scraping/scoring) so it runs regardless of RUN_SCHEDULER_IN_WEB.
+    try:
+        from scheduler import auto_apply_loop
+        tasks.append(asyncio.create_task(auto_apply_loop()))
+    except Exception as e:
+        print(f"[lifespan] could not start auto_apply_loop: {type(e).__name__}: {e}")
+    # The full scrape+score scheduler stays opt-in (the worker normally does it).
     if RUN_SCHEDULER_IN_WEB:
         from scheduler import scheduler_loop
-        task = asyncio.create_task(scheduler_loop())
+        tasks.append(asyncio.create_task(scheduler_loop()))
     yield
-    if task:
+    for task in tasks:
         task.cancel()
         try:
             await task

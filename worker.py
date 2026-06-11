@@ -13,6 +13,7 @@ from scrapers.dice import scrape_dice
 from scrapers.ycombinator import scrape_ycombinator
 from scrapers.wellfound import scrape_wellfound
 from scrapers.jsearch import scrape_jsearch
+from scrapers.ziprecruiter import scrape_ziprecruiter
 from matcher import score_jobs
 
 
@@ -32,6 +33,7 @@ async def main():
         ("Y Combinator",        scrape_ycombinator),
         ("Wellfound",           scrape_wellfound),
         ("LinkedIn/Indeed",     scrape_jsearch),
+        ("ZipRecruiter",        scrape_ziprecruiter),
     ]:
         try:
             count = await fn()
@@ -58,7 +60,12 @@ async def main():
         except Exception as e:
             print(f"    Error scoring user {user['id']}: {e}")
 
-    print("\n=== Done ===")
+    # NOTE: this worker is a SHORT-LIVED cron (it exits when main() returns),
+    # so it deliberately does NOT run auto-apply — Playwright applies take
+    # minutes and would be killed on exit. Queueing + draining happens in the
+    # long-running API service (scheduler.auto_apply_loop), which picks up the
+    # freshly-scored jobs within ~20 min.
+    print("\n=== Done (scrape + score). Auto-apply runs in the API service. ===")
 
 
 if __name__ == "__main__":
