@@ -51,6 +51,15 @@ ALGORITHM = "HS256"
 TOKEN_EXPIRE_HOURS = 24 * 7
 BCRYPT_MAX_BYTES = 72  # bcrypt truncates beyond this; apply the SAME truncation everywhere
 
+
+def _bcrypt_prep(password: str) -> bytes:
+    """bcrypt hashes at most 72 BYTES. Truncate at the BYTE level (not chars) —
+    `password[:72]` slices 72 characters, which for multibyte/unicode passwords
+    can exceed 72 bytes and make passlib raise (a 500). Returning bytes also
+    sidesteps passlib's own length check. Must be applied IDENTICALLY at hash
+    and verify time, or logins would never match."""
+    return password.encode("utf-8")[:BCRYPT_MAX_BYTES]
+
 class SignupRequest(BaseModel):
     email: str
     password: str
@@ -83,7 +92,7 @@ async def signup(request: Request, req: SignupRequest):
         existing = await conn.fetchrow("SELECT id FROM users WHERE email = $1", req.email)
         if existing:
             raise HTTPException(status_code=400, detail="Email already registered")
-        hashed = pwd_context.hash(req.password[:BCRYPT_MAX_BYTES])
+        hashed = pwd_context.hash(_bcrypt_prep(req.password))
         row = await conn.fetchrow("""
             INSERT INTO users (email, name, password_hash)
             VALUES ($1, $2, $3) RETURNING id
@@ -101,7 +110,7 @@ async def login(request: Request, req: LoginRequest):
         )
         if not user or not user["password_hash"]:
             raise HTTPException(status_code=401, detail="Invalid email or password")
-        password = req.password[:BCRYPT_MAX_BYTES]  # bcrypt max is 72 bytes
+        password = _bcrypt_prep(req.password)
         if not pwd_context.verify(password, user["password_hash"]):
             raise HTTPException(status_code=401, detail="Invalid email or password")
         token = create_token(user["id"], req.email)
@@ -167,7 +176,9 @@ async def reset_password(request: Request, req: ResetPasswordRequest):
         if not user or not user["reset_token"]:
             raise HTTPException(status_code=400, detail="Invalid or expired reset code")
 
-        if user["reset_token"] != req.code:
+        # Constant-time compare so the 6-digit code can't be brute-forced via
+        # response-timing (the != short-circuits on the first wrong digit).
+        if not _secrets.compare_digest(str(user["reset_token"]), str(req.code)):
             raise HTTPException(status_code=400, detail="Invalid or expired reset code")
 
         if datetime.utcnow() > user["reset_token_expires"]:
@@ -176,7 +187,7 @@ async def reset_password(request: Request, req: ResetPasswordRequest):
         # SECURITY: apply the SAME 72-byte truncation as signup/login.
         # Without this, a long password set via reset would be saved as bcrypt(full)
         # but login truncates to 72 bytes and the comparison would fail.
-        hashed = pwd_context.hash(req.new_password[:BCRYPT_MAX_BYTES])
+        hashed = pwd_context.hash(_bcrypt_prep(req.new_password))
         await conn.execute(
             "UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2",
             hashed, user["id"]

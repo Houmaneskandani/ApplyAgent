@@ -18,6 +18,12 @@ DICE_QUERIES = [
 
 
 async def scrape_dice():
+    # QUARANTINED: job-search-api.dice.com is dead (NXDOMAIN) — every query
+    # raised a connection error and spammed the logs 7×/cycle for 0 results.
+    # Short-circuit until the scraper is rewritten against Dice's current API.
+    print("  Dice: quarantined (API endpoint dead) — skipping")
+    return 0
+
     all_jobs = []
     seen_urls = set()
 

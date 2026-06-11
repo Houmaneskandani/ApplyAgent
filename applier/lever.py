@@ -499,16 +499,23 @@ async def submit_lever(
             print("    ✗ Submit button not found")
             return "failed"
 
-        # Use JS click to bypass hCaptcha iframe that intercepts pointer events
-        try:
-            await page.evaluate("""() => {
-                const btn = document.querySelector('[data-qa="btn-submit"]') ||
-                            document.querySelector('#btn-submit') ||
-                            document.querySelector('button[type="submit"]');
-                if (btn) btn.click();
-            }""")
-        except Exception:
-            await submit.first.click()
+        # hCaptcha only accepts a submission from a TRUSTED (isTrusted=true)
+        # event. A JS .click() is isTrusted=false and gets silently rejected —
+        # the likely cause of Lever "unknown" outcomes. So try a real Playwright
+        # click FIRST; only fall back to the JS click if the overlay iframe
+        # actually intercepts the pointer (the original reason JS-click existed).
+        clicked = await trusted_click(submit.first)
+        if not clicked:
+            print("    ⚠ Trusted click intercepted — falling back to JS click")
+            try:
+                await page.evaluate("""() => {
+                    const btn = document.querySelector('[data-qa="btn-submit"]') ||
+                                document.querySelector('#btn-submit') ||
+                                document.querySelector('button[type="submit"]');
+                    if (btn) btn.click();
+                }""")
+            except Exception:
+                pass
         await asyncio.sleep(3)
 
         success = page.locator(

@@ -729,7 +729,12 @@ async def _inject_hcaptcha_token(page, token: str) -> bool:
                 return !!ta;
             }})()
         """)
-        return True
+        # The JS returns whether the response textarea was actually found +
+        # set. Returning True unconditionally made callers log "✓ token
+        # injected!" even when nothing was injected.
+        if not result:
+            print("    ⚠ hCaptcha: response textarea not found — token not injected")
+        return bool(result)
     except Exception as e:
         print(f"    ⚠ hCaptcha injection error: {e}")
         return False

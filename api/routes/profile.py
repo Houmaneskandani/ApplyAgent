@@ -297,10 +297,17 @@ async def test_imap(request: Request, user=Depends(get_current_user)):
     imap_pass = decrypt((prefs or {}).get("imap_pass", ""))
     if not imap_user or not imap_pass:
         raise HTTPException(status_code=400, detail="No IMAP credentials saved — fill in Gmail and App Password first")
-    try:
+    def _blocking_imap_test():
+        # imaplib is synchronous + blocking; run it in a thread so a slow
+        # Gmail handshake doesn't freeze the whole async event loop (and every
+        # other request) for the duration of the login.
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(imap_user, imap_pass)
         mail.logout()
+
+    try:
+        import asyncio as _asyncio
+        await _asyncio.get_event_loop().run_in_executor(None, _blocking_imap_test)
         return {"ok": True, "message": f"✓ Connected to {imap_user} successfully"}
     except imaplib.IMAP4.error as e:
         err = str(e)
