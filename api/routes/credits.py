@@ -104,17 +104,41 @@ async def stripe_webhook(request: Request):
         raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
     try:
-        if event["type"] == "checkout.session.completed":
-            session = event["data"]["object"]
-            meta = session.get("metadata", {})
-            user_id = int(meta.get("user_id", 0))
-            credits = float(meta.get("credits", 0))
-            if user_id and credits:
-                await add_credits(user_id, credits)
-                print(f"  ✓ Added {credits} credits to user {user_id}")
+        from db import get_pool
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                # IDEMPOTENCY: record the event id first. Stripe delivers each
+                # event at-least-once (retries + duplicates); only the FIRST
+                # delivery inserts a row and proceeds to credit — duplicates hit
+                # ON CONFLICT DO NOTHING and are skipped. Doing the insert +
+                # credit in one transaction makes the whole thing atomic.
+                event_id = event.get("id")
+                row = await conn.fetchrow(
+                    "INSERT INTO stripe_events (event_id) VALUES ($1) "
+                    "ON CONFLICT (event_id) DO NOTHING RETURNING event_id",
+                    event_id,
+                )
+                if row is None:
+                    print(f"  ↩ Duplicate Stripe event {event_id} — skipping")
+                    return {"received": True, "duplicate": True}
+
+                if event["type"] == "checkout.session.completed":
+                    session = event["data"]["object"]
+                    meta = session.get("metadata", {})
+                    user_id = int(meta.get("user_id", 0))
+                    credits = float(meta.get("credits", 0))
+                    if user_id and credits:
+                        await conn.execute(
+                            "UPDATE users SET credits = COALESCE(credits, 0) + $1 WHERE id = $2",
+                            credits, user_id,
+                        )
+                        print(f"  ✓ Added {credits} credits to user {user_id} (event {event_id})")
 
         return {"received": True}
+    except HTTPException:
+        raise
     except Exception as e:
         # Internal processing error — log but return 500 (Stripe will retry).
-        print(f"  ⚠ Webhook processing error: {e}")
+        print(f"  ⚠ Webhook processing error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail="Webhook processing failed")

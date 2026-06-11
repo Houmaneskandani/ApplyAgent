@@ -57,6 +57,15 @@ async def init_db():
         # Fernet-encrypted, mirroring the imap_pass-at-rest pattern. NULL until
         # the user runs the one-time login-capture flow.
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ziprecruiter_session TEXT")
+        # Stripe webhook idempotency: one row per processed event id. The
+        # webhook inserts here (ON CONFLICT DO NOTHING) before crediting, so a
+        # retried/duplicate delivery can't grant credits twice.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS stripe_events (
+                event_id TEXT PRIMARY KEY,
+                processed_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
         await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS queue_position INTEGER DEFAULT 0")
         await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS dry_run BOOLEAN DEFAULT TRUE")
         # `force_submit` is a one-shot flag: the /force-submit endpoint sets
