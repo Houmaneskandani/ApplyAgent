@@ -355,9 +355,22 @@ async def run_pre_submit_review(
         print("    🔍 Reviewer auditing filled form before submit...")
         filled = await extract_filled_form_values(page_or_frame)
         if not filled:
-            print("    ⚠ Reviewer skipped: no filled fields detected "
-                  "(form may be in iframe we couldn't read)")
-            return False
+            # SAFETY: if we can't read a SINGLE filled field, we can't verify
+            # the application — and the form-filler may have silently filled
+            # nothing. Submitting blind risks sending an empty/garbage
+            # application to a real employer (and burning a credit). BLOCK and
+            # route to Needs Review instead of proceeding. (force_submit above
+            # still lets the user override.)
+            print("    ✗ Reviewer: no filled fields detected — blocking submit "
+                  "(empty form or unreadable iframe). Routing to Needs Review.")
+            if user_info is not None:
+                user_info["_reviewer_notes"] = (
+                    "Couldn't verify the application — no filled fields were "
+                    "detectable before submit (the form may have failed to fill, "
+                    "or it's in an iframe we can't read). Check the job and retry, "
+                    "or use 'Submit anyway' if it looks correct."
+                )
+            return True
 
         print(f"    🔍 Reviewer found {len(filled)} filled fields — "
               f"sending to Claude...")
