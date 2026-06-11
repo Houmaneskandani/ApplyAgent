@@ -230,6 +230,7 @@ async def _set_step(user_id: int, job_id: int, step: str):
 async def run_application(job: dict, user_id: int, dry_run: bool):
     tmp_resume_path = None
     job_id = job["id"]
+    credit_reserved = False  # set True once we atomically deduct (live mode)
     try:
         await _set_step(user_id, job_id, "Loading profile...")
         user = await get_user_info(user_id)
@@ -327,6 +328,19 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         url = job.get("url", "")
         source = job.get("source", "")
 
+        # CREDIT RESERVATION (live only). Atomically deduct 0.4 BEFORE applying
+        # so a user can't queue many live applies on a single credit's balance
+        # — the enqueue-time check reads the same balance for every concurrent
+        # request and is NOT a reservation. We refund below if the apply
+        # doesn't succeed, honoring the "no charge on bot failure" promise.
+        if not dry_run:
+            credit_reserved = await deduct_credits(user_id, 0.4)
+            if not credit_reserved:
+                print(f"  ✗ Insufficient credits for user {user_id} — skipping live apply")
+                await _set_step(user_id, job_id, "Insufficient credits — purchase more to apply")
+                await update_application_status(user_id, job_id, "failed")
+                return
+
         await _set_step(user_id, job_id, "Opening job page...")
         if source == "greenhouse" or "greenhouse.io" in url or "gh_jid" in url:
             await _set_step(user_id, job_id, "Filling Greenhouse form...")
@@ -378,13 +392,15 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         else:
             await update_application_status(user_id, job_id, result)
 
-        # Deduct 0.4 credits on successful real application
-        if result == "applied" and not dry_run:
-            ok = await deduct_credits(user_id, 0.4)
-            if ok:
-                print(f"  ✓ Deducted 0.4 credits from user {user_id}")
-            else:
-                print(f"  ⚠ Could not deduct credits from user {user_id} (low balance?)")
+        # The credit was reserved (deducted) upfront. Refund it unless the
+        # apply actually succeeded — "no charge on bot failure".
+        if credit_reserved and result != "applied":
+            from db import add_credits
+            await add_credits(user_id, 0.4)
+            credit_reserved = False
+            print(f"  ↩ Refunded 0.4 credits (result={result})")
+        elif result == "applied" and not dry_run:
+            print(f"  ✓ Charged 0.4 credits from user {user_id}")
 
         try:
             from notifications import notify_application
@@ -405,9 +421,19 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         import traceback
         print(f"  ✗ Application error: {e}")
         traceback.print_exc()
-        await _set_step(user_id, job_id, f"Error: {e}")
+        # SECURITY: don't echo raw exception text into the user-visible notes
+        # column — it can leak internal paths/details. Keep the detail in logs.
+        await _set_step(user_id, job_id, "Apply failed — see Needs Review")
         # Dry run errors reset to 'new' so the job stays visible in Job Matches
         await update_application_status(user_id, job_id, "new" if dry_run else "failed")
+        # Refund the reserved credit — the apply errored, so no charge.
+        if credit_reserved:
+            try:
+                from db import add_credits
+                await add_credits(user_id, 0.4)
+                print(f"  ↩ Refunded 0.4 credits (apply errored)")
+            except Exception:
+                pass
     finally:
         if tmp_resume_path and os.path.exists(tmp_resume_path):
             os.unlink(tmp_resume_path)
@@ -425,28 +451,40 @@ async def confirm_unknown_apply(job_id: int, request: Request, user=Depends(get_
     user_id = user["user_id"]
     pool = await get_pool()
     async with pool.acquire() as conn:
-        existing = await conn.fetchrow(
-            "SELECT status FROM applications WHERE user_id = $1 AND job_id = $2",
+        # Atomically CLAIM the unknown→applied transition. The conditional
+        # UPDATE is the lock: only ONE concurrent confirm matches `status =
+        # 'unknown'` and gets a RETURNING row; the loser/duplicate gets nothing
+        # — so the credit can only be charged once (was a double-charge race).
+        claimed = await conn.fetchrow(
+            """
+            UPDATE applications
+               SET status = 'applied', applied_at = COALESCE(applied_at, NOW())
+             WHERE user_id = $1 AND job_id = $2 AND status = 'unknown'
+            RETURNING id
+            """,
             user_id, job_id,
         )
-        if not existing:
-            raise HTTPException(status_code=404, detail="Application not found")
-        if existing["status"] == "applied":
-            return {"status": "applied", "already": True}
-        if existing["status"] != "unknown":
+        if not claimed:
+            cur = await conn.fetchrow(
+                "SELECT status FROM applications WHERE user_id = $1 AND job_id = $2",
+                user_id, job_id,
+            )
+            if not cur:
+                raise HTTPException(status_code=404, detail="Application not found")
+            if cur["status"] == "applied":
+                return {"status": "applied", "already": True}
             raise HTTPException(
                 status_code=400,
-                detail=f"Can only confirm applications in 'unknown' state (current: {existing['status']})",
+                detail=f"Can only confirm applications in 'unknown' state (current: {cur['status']})",
             )
-        # Atomic credit deduction. If the user has 0 credits, allow the
-        # confirmation but don't go negative — the bot already did the work,
-        # we're not going to refuse a "yes it worked" confirmation. Best-effort.
+        # We won the claim — charge exactly once. Best-effort: if the user has
+        # 0 credits we still keep the confirmation (the bot already did the
+        # work) rather than reverting it.
         deducted = await deduct_credits(user_id, 0.4)
         await conn.execute(
             """
             UPDATE applications
-               SET status = 'applied', applied_at = COALESCE(applied_at, NOW()),
-                   notes = CASE WHEN $3 THEN 'Manually confirmed — credit charged'
+               SET notes = CASE WHEN $3 THEN 'Manually confirmed — credit charged'
                                 ELSE 'Manually confirmed — credit waived (low balance)' END
              WHERE user_id = $1 AND job_id = $2
             """,
