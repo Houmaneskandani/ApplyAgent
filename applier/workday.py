@@ -93,19 +93,21 @@ async def _walk_workday_wizard(page, info: dict, profile_text: str, dry_run: boo
         await asyncio.sleep(2)
         print(f"    → Step {step + 1}...")
 
-        # Check if we landed on a confirmation / success page
+        # Only trust RELIABLE post-submit confirmation signals. Loose matches
+        # like "complete" in the URL or [class*='success'] (a common CSS
+        # utility) fire on PRE-submit wizard pages — which falsely reported
+        # "applied" (charging a credit + telling the user they applied when
+        # they hadn't). Workday's real confirmation is data-automation-id=
+        # 'confirmationPage' or an explicit "Thank you for applying" heading.
         url_lower = page.url.lower()
-        if any(w in url_lower for w in ("thank", "confirm", "success", "submitted", "complete")):
-            print("    ✓ Confirmation URL detected")
-            return "applied"
-
+        confirmed_url = any(w in url_lower for w in ("/thankyou", "/confirmation", "submitted"))
         success_el = page.locator(
             "[data-automation-id='confirmationPage'], "
-            "h1:has-text('Thank'), h2:has-text('Thank'), "
-            "[class*='confirmation'], [class*='success']"
+            "h1:has-text('Thank you for applying'), h2:has-text('Thank you for applying'), "
+            "text=/your application (has been|was) submitted/i"
         )
-        if await success_el.count() > 0:
-            print("    ✓ Confirmation element found")
+        if confirmed_url or await success_el.count() > 0:
+            print("    ✓ Workday confirmation detected")
             return "applied"
 
         # Fill whatever fields are visible on this step
