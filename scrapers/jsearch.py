@@ -17,6 +17,59 @@ JSEARCH_QUERIES = [
     "data engineer",
 ]
 
+# Direct-ATS host → source label. Mirrors classify_ats / the apply dispatcher
+# so a job we re-tag here routes to the matching applier. Order = preference:
+# these are the ATSes our Playwright appliers actually work on. JSearch often
+# surfaces a job via an aggregator (ZipRecruiter/LinkedIn) while ALSO listing
+# the employer's real ATS link in apply_options — we want the ATS link.
+_ATS_HOSTS = [
+    ("greenhouse.io", "greenhouse"),
+    ("greenhouse",    "greenhouse"),   # boards.greenhouse.io / job-boards.greenhouse.io
+    ("lever.co",      "lever"),
+    ("ashbyhq.com",   "ashby"),
+    ("ashby.io",      "ashby"),
+    ("smartrecruiters.com", "smartrecruiters"),
+    ("myworkdayjobs.com",   "workday"),
+    ("workday.com",         "workday"),
+]
+
+
+def _ats_for_url(url: str) -> str | None:
+    """Return the ATS source label if `url` is a known direct-ATS host."""
+    u = (url or "").lower()
+    for host, label in _ATS_HOSTS:
+        if host in u:
+            return label
+    return None
+
+
+def _pick_apply_link(job: dict) -> tuple[str, str | None]:
+    """
+    Choose the best apply link for a JSearch result.
+
+    Returns (url, ats_label). Prefers a DIRECT-ATS link (Greenhouse/Lever/...)
+    drawn from job_apply_link OR any apply_options[] entry, because that's
+    where our appliers succeed — turning ZipRecruiter/LinkedIn into discovery
+    channels that reroute to the real ATS. Falls back to the primary apply
+    link, then the Google link. ats_label is None when no direct ATS matched.
+    """
+    candidates = []
+    primary = job.get("job_apply_link") or ""
+    if primary:
+        candidates.append(primary)
+    for opt in (job.get("apply_options") or []):
+        link = (opt or {}).get("apply_link") or ""
+        if link:
+            candidates.append(link)
+    # First candidate that is a direct ATS host wins.
+    for link in candidates:
+        label = _ats_for_url(link)
+        if label:
+            return link, label
+    # No direct ATS — keep the primary apply link (or Google fallback).
+    fallback = primary or job.get("job_google_link") or ""
+    return fallback, None
+
 
 async def scrape_jsearch():
     if not RAPIDAPI_KEY:
@@ -59,26 +112,32 @@ async def scrape_jsearch():
                     if not is_engineering_job(title):
                         continue
 
-                    url = job.get("job_apply_link", "") or job.get("job_google_link", "")
+                    # Prefer a direct-ATS apply link (where our appliers work)
+                    # over the aggregator's own link.
+                    url, ats_label = _pick_apply_link(job)
                     if not url or url in seen_urls:
                         continue
                     seen_urls.add(url)
 
-                    # Tag the original platform as source label
-                    publisher = (job.get("job_publisher") or "").lower()
-                    apply_link = (job.get("job_apply_link") or "").lower()
-                    if "ziprecruiter" in publisher or "ziprecruiter.com" in apply_link:
-                        # Tag ZR so the dispatcher routes to the 1-Click applier
-                        # and the dashboard ATS chip groups it correctly.
-                        source = "ziprecruiter"
-                    elif "linkedin" in publisher:
-                        source = "linkedin"
-                    elif "indeed" in publisher:
-                        source = "indeed"
-                    elif "glassdoor" in publisher:
-                        source = "glassdoor"
+                    if ats_label:
+                        # Re-tag to the underlying ATS so the dispatcher routes
+                        # to that applier (e.g. ZipRecruiter listing → Greenhouse).
+                        source = ats_label
                     else:
-                        source = "jsearch"
+                        # No direct ATS — tag the original platform as the label.
+                        publisher = (job.get("job_publisher") or "").lower()
+                        apply_link = (job.get("job_apply_link") or "").lower()
+                        if "ziprecruiter" in publisher or "ziprecruiter.com" in apply_link:
+                            # ZR 1-Click applier + dashboard ATS chip grouping.
+                            source = "ziprecruiter"
+                        elif "linkedin" in publisher:
+                            source = "linkedin"
+                        elif "indeed" in publisher:
+                            source = "indeed"
+                        elif "glassdoor" in publisher:
+                            source = "glassdoor"
+                        else:
+                            source = "jsearch"
 
                     city = job.get("job_city", "") or ""
                     state = job.get("job_state", "") or ""
@@ -100,5 +159,9 @@ async def scrape_jsearch():
     linkedin = sum(1 for j in all_jobs if j["source"] == "linkedin")
     indeed = sum(1 for j in all_jobs if j["source"] == "indeed")
     zr = sum(1 for j in all_jobs if j["source"] == "ziprecruiter")
-    print(f"  JSearch: {len(all_jobs)} jobs (LinkedIn: {linkedin}, Indeed: {indeed}, ZipRecruiter: {zr})")
+    rerouted = sum(1 for j in all_jobs if _ats_for_url(j["url"]))
+    print(
+        f"  JSearch: {len(all_jobs)} jobs (LinkedIn: {linkedin}, Indeed: {indeed}, "
+        f"ZipRecruiter: {zr}, rerouted→ATS: {rerouted})"
+    )
     return len(all_jobs)
