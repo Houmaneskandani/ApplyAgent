@@ -49,7 +49,10 @@ def _send_email(subject: str, body: str, to_email: str):
         msg["Subject"] = subject
         msg["From"] = SMTP_USER
         msg["To"] = to_email
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        # timeout is essential: without it, a hung/unreachable SMTP host
+        # blocks the socket indefinitely — which (since this is called from
+        # the apply path) would freeze a worker on every failed send.
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as server:
             server.starttls()
             server.login(SMTP_USER, SMTP_PASS)
             server.sendmail(SMTP_USER, to_email, msg.as_string())

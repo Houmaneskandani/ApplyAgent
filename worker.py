@@ -9,9 +9,8 @@ from scrapers.greenhouse import scrape_greenhouse
 from scrapers.lever import scrape_lever
 from scrapers.himalayas import scrape_himalayas
 from scrapers.remotive import scrape_remotive
-from scrapers.dice import scrape_dice
-from scrapers.ycombinator import scrape_ycombinator
-from scrapers.wellfound import scrape_wellfound
+# dice/ycombinator/wellfound retired — APIs dead or bot-walled (0 results,
+# log noise). Files kept in scrapers/ for future revival.
 from scrapers.jsearch import scrape_jsearch
 from scrapers.ziprecruiter import scrape_ziprecruiter
 from matcher import score_jobs
@@ -29,9 +28,6 @@ async def main():
         ("Lever",               scrape_lever),
         ("Himalayas",           scrape_himalayas),
         ("Remotive/Remote.co",  scrape_remotive),
-        ("Dice",                scrape_dice),
-        ("Y Combinator",        scrape_ycombinator),
-        ("Wellfound",           scrape_wellfound),
         ("LinkedIn/Indeed",     scrape_jsearch),
         ("ZipRecruiter",        scrape_ziprecruiter),
     ]:

@@ -364,11 +364,15 @@ async def run_pre_submit_review(
             print("    ✗ Reviewer: no filled fields detected — blocking submit "
                   "(empty form or unreadable iframe). Routing to Needs Review.")
             if user_info is not None:
+                # MUST start with "Reviewer blocked" — the dashboard's
+                # "Submit anyway" override button is gated on that substring.
+                # Without the prefix, the most common block case (empty/
+                # unreadable form) silently offered no override.
                 user_info["_reviewer_notes"] = (
-                    "Couldn't verify the application — no filled fields were "
-                    "detectable before submit (the form may have failed to fill, "
-                    "or it's in an iframe we can't read). Check the job and retry, "
-                    "or use 'Submit anyway' if it looks correct."
+                    "Reviewer blocked: couldn't verify the application — no filled "
+                    "fields were detectable before submit (the form may have failed "
+                    "to fill, or it's in an iframe we can't read). Use 'Submit "
+                    "anyway' if it looks correct, or retry."
                 )
             return True
 

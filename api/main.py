@@ -61,6 +61,16 @@ RUN_SCHEDULER_IN_WEB = os.getenv("RUN_SCHEDULER_IN_WEB", "0") == "1"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     tasks = []
+    # Ensure schema/migrations are applied before any background loop touches
+    # the DB. init_db is idempotent (CREATE TABLE/COLUMN IF NOT EXISTS), so a
+    # fresh deploy or a newly-added column can't strand the auto-apply loop on
+    # a missing-table/column error. Non-fatal: if it fails, the API still boots
+    # and request handlers surface the real error.
+    try:
+        from db import init_db
+        await init_db()
+    except Exception as e:
+        print(f"[lifespan] init_db failed (continuing): {type(e).__name__}: {e}")
     # ALWAYS run the auto-apply + queue-drain loop in the (long-running) web
     # service. Applies are long Playwright sessions that can only complete in a
     # persistent process — the short-lived cron worker can't run them. This is
