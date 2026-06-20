@@ -1,9 +1,38 @@
 import asyncio
 import json
 import os
+import time
 
 DAILY_LIMIT = 10
 MIN_SCORE = 6  # bot won't auto-apply to anything weaker than this
+
+# Heartbeat for the always-on auto_apply_loop. Sentry's FastAPI integration
+# only captures exceptions raised inside REQUEST handlers — a background loop
+# that silently dies (or stops ticking) would otherwise be invisible. /health
+# reads this so an uptime monitor can alert on a stalled loop.
+_LOOP_HEARTBEAT: dict = {
+    "last_tick": None,    # epoch secs — start of the most recent cycle
+    "last_ok": None,      # epoch secs — last cycle that finished cleanly
+    "last_error": None,   # str — type+msg of the last cycle error
+    "ticks": 0,
+}
+
+
+def _capture(exc: Exception) -> None:
+    """Forward a background-loop exception to Sentry if available (else no-op)."""
+    try:
+        import sentry_sdk
+        sentry_sdk.capture_exception(exc)
+    except Exception:
+        pass
+
+
+def loop_heartbeat() -> dict:
+    """Snapshot of the auto_apply_loop heartbeat for /health."""
+    hb = dict(_LOOP_HEARTBEAT)
+    last = hb.get("last_tick")
+    hb["seconds_since_tick"] = round(time.time() - last, 1) if last else None
+    return hb
 
 
 def _live_apply_allowlist() -> set:
@@ -379,14 +408,25 @@ async def auto_apply_loop():
     # responsive without hammering the DB.
     while True:
         await asyncio.sleep(1200)
+        _LOOP_HEARTBEAT["last_tick"] = time.time()
+        _LOOP_HEARTBEAT["ticks"] += 1
+        cycle_ok = True
         try:
             await _sweep_zombie_applications()
         except Exception as e:
+            cycle_ok = False
+            _LOOP_HEARTBEAT["last_error"] = f"sweep: {type(e).__name__}: {e}"
             print(f"[AutoApplyLoop] zombie sweep failed: {type(e).__name__}: {e}")
+            _capture(e)
         try:
             await run_auto_apply()
         except Exception as e:
+            cycle_ok = False
+            _LOOP_HEARTBEAT["last_error"] = f"auto_apply: {type(e).__name__}: {e}"
             print(f"[AutoApplyLoop] error: {type(e).__name__}: {e}")
+            _capture(e)
+        if cycle_ok:
+            _LOOP_HEARTBEAT["last_ok"] = time.time()
 
 
 async def _sweep_zombie_applications():

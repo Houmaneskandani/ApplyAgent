@@ -290,39 +290,48 @@ async def per_ats_stats(user=Depends(get_current_user)):
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Group by the EFFECTIVE ATS the dispatcher routed to —
+        # classify_ats(source, url) — NOT the raw j.source. A job tagged
+        # source='ziprecruiter' but hosted on Greenhouse is applied via the
+        # Greenhouse applier, so its outcome belongs in the greenhouse bucket.
+        # classify_ats is Python substring logic, so we aggregate in Python.
         rows = await conn.fetch("""
-            SELECT
-              COALESCE(j.source, 'unknown') AS source,
-              COUNT(*) FILTER (WHERE a.status = 'applied') AS applied,
-              COUNT(*) FILTER (WHERE a.status = 'failed')  AS failed,
-              COUNT(*) FILTER (WHERE a.status = 'unknown') AS unknown,
-              COUNT(*) AS total
+            SELECT j.source AS source, j.url AS url, a.status AS status
               FROM applications a
               JOIN jobs j ON j.id = a.job_id
              WHERE a.user_id = $1
                AND a.dry_run = FALSE
                AND a.status IN ('applied', 'failed', 'unknown')
-             GROUP BY j.source
-             ORDER BY total DESC, applied DESC
         """, user["user_id"])
 
-    out = []
+    buckets: dict = {}
     for r in rows:
-        total = int(r["total"] or 0)
-        applied = int(r["applied"] or 0)
-        # Success rate is `applied / total`. Excludes `unknown` from
-        # the denominator? No — we keep it in. Unknowns mean we tried
-        # and couldn't confirm; from a reliability lens that's still
-        # a failed attempt until the user manually confirms it.
+        ats = classify_ats(r["source"], r["url"]) or "generic"
+        b = buckets.setdefault(
+            ats, {"applied": 0, "failed": 0, "unknown": 0, "total": 0}
+        )
+        b["total"] += 1
+        st = r["status"]
+        if st in b:
+            b[st] += 1
+
+    out = []
+    for ats, b in buckets.items():
+        total = b["total"]
+        applied = b["applied"]
+        # Success rate = applied / total. Unknowns stay IN the denominator —
+        # "tried but couldn't confirm" is a failed attempt until the user
+        # manually confirms it.
         success_rate = round(100.0 * applied / total, 1) if total else None
         out.append({
-            "source": r["source"],
+            "source": ats,
             "applied": applied,
-            "failed": int(r["failed"] or 0),
-            "unknown": int(r["unknown"] or 0),
+            "failed": b["failed"],
+            "unknown": b["unknown"],
             "total": total,
             "success_rate_pct": success_rate,
         })
+    out.sort(key=lambda x: (x["total"], x["applied"]), reverse=True)
     return {"per_ats": out, "total_attempts": sum(x["total"] for x in out)}
 
 

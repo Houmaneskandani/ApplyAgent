@@ -190,6 +190,27 @@ async def health():
     checks["capsolver"]  = {"configured": bool(CAPSOLVER_API_KEY)}
     checks["secrets_at_rest"] = {"configured": bool(SECRETS_ENCRYPTION_KEY)}
 
+    # Background auto-apply loop heartbeat. The loop ticks every ~20 min; a gap
+    # well past that means it stalled/died. We DON'T return non-200 for this
+    # (Railway would restart the web service on a false positive) — the status
+    # field flips to "degraded" so an uptime monitor can alert. "starting" =
+    # booted but hasn't reached its first tick yet (normal for ~20 min after
+    # deploy); never marks degraded.
+    try:
+        from scheduler import loop_heartbeat
+        hb = loop_heartbeat()
+        gap = hb.get("seconds_since_tick")
+        STALL_THRESHOLD = 3000  # ~50 min = 2.5 missed cycles
+        if hb.get("last_tick") is None:
+            checks["auto_apply_loop"] = {"ok": True, "state": "starting", **hb}
+        elif gap is not None and gap > STALL_THRESHOLD:
+            checks["auto_apply_loop"] = {"ok": False, "state": "stalled", **hb}
+            overall_ok = False
+        else:
+            checks["auto_apply_loop"] = {"ok": True, "state": "alive", **hb}
+    except Exception as e:
+        checks["auto_apply_loop"] = {"ok": True, "state": "unknown", "error": type(e).__name__}
+
     return {
         "status": "ok" if overall_ok else "degraded",
         "uptime_seconds": round(time.time() - _BOOT_TIME, 1),

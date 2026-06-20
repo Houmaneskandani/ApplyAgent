@@ -56,6 +56,16 @@ async def main():
         except Exception as e:
             print(f"    Error scoring user {user['id']}: {e}")
 
+    # Prune long-expired postings nobody touched. Runs here (the 6h cron), not
+    # the always-on API loop, since it's a once-per-cycle housekeeping step.
+    try:
+        from db import prune_stale_jobs
+        pruned = await prune_stale_jobs()
+        if pruned:
+            print(f"\n── Pruned {pruned} stale job(s) (no applications, past retention) ──")
+    except Exception as e:
+        print(f"    Prune failed: {type(e).__name__}: {e}")
+
     # NOTE: this worker is a SHORT-LIVED cron (it exits when main() returns),
     # so it deliberately does NOT run auto-apply — Playwright applies take
     # minutes and would be killed on exit. Queueing + draining happens in the

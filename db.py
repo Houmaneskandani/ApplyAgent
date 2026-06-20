@@ -159,21 +159,69 @@ async def insert_jobs_batch(jobs: list[dict]):
         )
 
 
-async def get_unscored_jobs(user_id: int, rescore: bool = False, limit: int = 100):
+async def get_unscored_jobs(user_id: int, rescore: bool = False, limit: int = None):
+    # Score the FRESHEST jobs first. Previously there was no ORDER BY, so with
+    # a backlog of unscored rows the DB returned an arbitrary (effectively
+    # oldest-by-insertion) slice — newly-scraped postings could starve and
+    # never reach the scorer. created_at DESC fixes that. Cap is env-tunable
+    # (raised from 100 → 250 default) so a multi-category/ZR/JSearch cycle
+    # clears its backlog in fewer passes.
+    if limit is None:
+        try:
+            limit = int(os.getenv("MATCHER_SCORE_LIMIT", "250"))
+        except ValueError:
+            limit = 250
     pool = await get_pool()
     async with pool.acquire() as conn:
         if rescore:
-            return await conn.fetch("SELECT * FROM jobs LIMIT $1", limit)
+            return await conn.fetch(
+                "SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1", limit
+            )
         return await conn.fetch(
             """
             SELECT j.* FROM jobs j
             LEFT JOIN applications a ON a.job_id = j.id AND a.user_id = $1
             WHERE a.id IS NULL OR a.score IS NULL
+            ORDER BY j.created_at DESC
             LIMIT $2
             """,
             user_id,
             limit,
         )
+
+
+async def prune_stale_jobs(retention_days: int = None) -> int:
+    """
+    Delete old postings that NObody has scored/queued/applied to.
+
+    Safe by construction: only removes jobs older than retention_days that have
+    ZERO application rows referencing them (NOT IN (SELECT job_id ...)) — so no
+    user's score, queue entry, or apply history is ever touched. Keeps the jobs
+    table lean and stops the scorer from re-considering long-expired postings.
+    Returns the number of rows deleted. Env-tunable via JOB_RETENTION_DAYS.
+    """
+    if retention_days is None:
+        try:
+            retention_days = int(os.getenv("JOB_RETENTION_DAYS", "45"))
+        except ValueError:
+            retention_days = 45
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM jobs
+             WHERE created_at < NOW() - ($1 || ' days')::interval
+               AND NOT EXISTS (
+                   SELECT 1 FROM applications a WHERE a.job_id = jobs.id
+               )
+            """,
+            str(retention_days),
+        )
+    # asyncpg returns a tag like "DELETE 37"; parse the count.
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError, AttributeError):
+        return 0
 
 
 async def upsert_application(user_id: int, job_id: int, score: int):
