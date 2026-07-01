@@ -98,16 +98,29 @@ async def get_jobs(
     min_score: int = 1,
     limit: int = 100,
     ats: str | None = None,
+    search: str | None = None,
+    location: str | None = None,
     user=Depends(get_current_user),
 ):
     """
     List the user's top-scored jobs.
 
-    `ats` (optional): one of greenhouse | lever | ashby | workday |
-    smartrecruiters | generic. When provided, joins to `jobs` and
-    filters by the dispatcher's effective applier — same CASE expression
-    as classify_ats(). Solves the "I can't find any Lever jobs because
-    Greenhouse dominates my top 200" visibility problem on the dashboard.
+    Optional server-side filters — ALL applied BEFORE the score-DESC LIMIT so
+    they search the user's WHOLE scored set, not just the top-N slice the
+    dashboard would otherwise download and filter in the browser:
+      • `ats`      — the dispatcher's effective applier (same CASE as
+                     classify_ats). Solves "I can't find any Lever jobs because
+                     Greenhouse dominates my top 200".
+      • `location` — substring match on job location (e.g. "Seattle"). Without
+                     this, a client-side Seattle filter only ever saw the ~8
+                     Seattle jobs that happened to land in the global top-200;
+                     in SQL the LIMIT now picks the top-200 SEATTLE jobs.
+      • `search`   — substring across title / company / location.
+
+    `location`/`search` match ONLY columns the frontend's client-side filters
+    also see (title/company/location) — the client additionally matches the
+    description snippet, i.e. it's a strict SUPERSET, so the client refinement
+    pass never re-hides a row the server returned.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -117,51 +130,57 @@ async def get_jobs(
         VALID_ATS = {"greenhouse", "lever", "ashby", "workday", "smartrecruiters", "ziprecruiter", "generic"}
         ats_filter = ats if ats in VALID_ATS else None
 
+        # Assemble the WHERE clause with positional params. EVERY value is
+        # bound ($n) — never string-interpolated — so this stays injection-safe
+        # exactly like the original ats parameterization.
+        where = ["a.user_id = $1", "a.score >= $2"]
+        args: list = [user_id, min_score]
+
+        def _bind(val) -> str:
+            args.append(val)
+            return f"${len(args)}"
+
+        loc = (location or "").strip()
+        if loc:
+            where.append(f"j.location ILIKE '%' || {_bind(loc)} || '%'")
+
+        q = (search or "").strip()
+        if q:
+            p = _bind(q)
+            where.append(
+                f"(j.title ILIKE '%'||{p}||'%' "
+                f"OR j.company ILIKE '%'||{p}||'%' "
+                f"OR j.location ILIKE '%'||{p}||'%')"
+            )
+
         if ats_filter:
-            # Apply the same CASE classifier inline against the joined
-            # jobs row so we filter BEFORE the LIMIT (otherwise the
-            # top-N-by-score would still drop Lever in favor of
-            # Greenhouse jobs that fill the slots).
-            apps = await conn.fetch(
-                """
-                SELECT a.job_id, a.score, a.status, a.applied_at, a.notes
-                  FROM applications a
-                  JOIN jobs j ON j.id = a.job_id
-                 WHERE a.user_id = $1 AND a.score >= $2
-                   AND CASE
-                         WHEN j.source = 'greenhouse'
-                           OR j.url LIKE '%greenhouse.io%'
-                           OR j.url LIKE '%gh_jid%'   THEN 'greenhouse'
-                         WHEN j.source = 'lever'
-                           OR j.url LIKE '%lever.co%' THEN 'lever'
-                         WHEN j.source = 'ashby'
-                           OR j.url LIKE '%ashby.io%'
-                           OR j.url LIKE '%ashbyhq.com%' THEN 'ashby'
-                         WHEN j.source = 'smartrecruiters'
-                           OR j.url LIKE '%smartrecruiters.com%' THEN 'smartrecruiters'
-                         WHEN j.source = 'workday'
-                           OR j.url LIKE '%myworkdayjobs.com%'
-                           OR j.url LIKE '%workday.com%' THEN 'workday'
-                         WHEN j.source = 'ziprecruiter'
-                           OR j.url LIKE '%ziprecruiter.com%' THEN 'ziprecruiter'
-                         ELSE 'generic'
-                       END = $4
-                 ORDER BY a.score DESC
-                 LIMIT $3
-                """,
-                user_id, min_score, limit, ats_filter,
+            # Same CASE classifier as classify_ats(), applied pre-LIMIT.
+            where.append(
+                "CASE "
+                "WHEN j.source = 'greenhouse' OR j.url LIKE '%greenhouse.io%' OR j.url LIKE '%gh_jid%' THEN 'greenhouse' "
+                "WHEN j.source = 'lever' OR j.url LIKE '%lever.co%' THEN 'lever' "
+                "WHEN j.source = 'ashby' OR j.url LIKE '%ashby.io%' OR j.url LIKE '%ashbyhq.com%' THEN 'ashby' "
+                "WHEN j.source = 'smartrecruiters' OR j.url LIKE '%smartrecruiters.com%' THEN 'smartrecruiters' "
+                "WHEN j.source = 'workday' OR j.url LIKE '%myworkdayjobs.com%' OR j.url LIKE '%workday.com%' THEN 'workday' "
+                "WHEN j.source = 'ziprecruiter' OR j.url LIKE '%ziprecruiter.com%' THEN 'ziprecruiter' "
+                "ELSE 'generic' END = " + _bind(ats_filter)
             )
-        else:
-            apps = await conn.fetch(
-                """
-                SELECT job_id, score, status, applied_at, notes
-                  FROM applications
-                 WHERE user_id = $1 AND score >= $2
-                 ORDER BY score DESC
-                 LIMIT $3
-                """,
-                user_id, min_score, limit,
-            )
+
+        # Always JOIN jobs (cheap PK join) so location/search/ats can filter
+        # pre-LIMIT. The SELECTed columns are unchanged, so the response shape
+        # is byte-identical to before.
+        limit_p = _bind(limit)
+        apps = await conn.fetch(
+            f"""
+            SELECT a.job_id, a.score, a.status, a.applied_at, a.notes
+              FROM applications a
+              JOIN jobs j ON j.id = a.job_id
+             WHERE {' AND '.join(where)}
+             ORDER BY a.score DESC
+             LIMIT {limit_p}
+            """,
+            *args,
+        )
 
         if not apps:
             return []
