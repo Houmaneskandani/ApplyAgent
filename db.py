@@ -12,12 +12,20 @@ async def get_pool():
             raise RuntimeError(
                 "DATABASE_URL is not set. Add it to .env (Supabase → Settings → Database)."
             )
+        # DB_POOL_MAX: Supabase's session-mode pooler allows 15 clients TOTAL
+        # across the API service, the cron worker, and any ad-hoc scripts.
+        # The always-on API keeps the default 10; short-lived workers/scripts
+        # should set DB_POOL_MAX=2 so they can't starve the API (EMAXCONNSESSION).
+        try:
+            _max = int(os.getenv("DB_POOL_MAX", "10"))
+        except ValueError:
+            _max = 10
         _pool = await asyncpg.create_pool(
             DATABASE_URL,
             ssl="require",
             statement_cache_size=0,
             min_size=1,
-            max_size=10,
+            max_size=max(1, _max),
             max_inactive_connection_lifetime=300,
         )
     return _pool

@@ -106,12 +106,15 @@ async def scrape_jsearch():
             else:
                 search_q = f"{query} remote"
             try:
+                # /search was retired by the publisher (404s); /search-v2 is
+                # the current endpoint. Cursor-based pagination — we take the
+                # first page only (~10 jobs/query) to stay inside the RapidAPI
+                # quota; page/num_pages params no longer exist.
                 r = await client.get(
-                    "https://jsearch.p.rapidapi.com/search",
+                    "https://jsearch.p.rapidapi.com/search-v2",
                     params={
                         "query": search_q,
-                        "page": "1",
-                        "num_pages": "2",
+                        "country": "us",
                         "date_posted": "week",
                     },
                 )
@@ -119,7 +122,13 @@ async def scrape_jsearch():
                     print(f"  JSearch [{query}] HTTP {r.status_code}")
                     continue
 
-                for job in r.json().get("data", []):
+                payload = r.json().get("data")
+                if isinstance(payload, dict):
+                    results = payload.get("jobs") or []   # v2 shape: {cursor, jobs}
+                else:
+                    results = payload or []               # legacy shape: bare list
+
+                for job in results:
                     title = job.get("job_title", "")
                     if not is_engineering_job(title):
                         continue
