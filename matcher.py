@@ -371,10 +371,12 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     import job_categories as _jc
     _local_cat_keys = _jc.local_keys()
     _user_local_cats = set(prefs.get("job_categories") or []) & _local_cat_keys
+    # Tokens >2 chars only: "Irvine, CA" must not produce a bare "ca" token,
+    # which would substring-match Chicago/Casablanca/... and mis-score them 7.
     _local_area_tokens = [
         t.strip().lower()
         for t in ((prefs.get("local_job_area") or prefs.get("city") or "").split(","))
-        if t.strip()
+        if len(t.strip()) > 2
     ]
 
     def _rule_score_local(job_dict) -> int:
