@@ -139,6 +139,11 @@ app.add_middleware(
         "Origin",
         "X-Requested-With",
     ],
+    # Response headers the browser JS is allowed to read. X-Total-Count
+    # carries the full match count for GET /jobs/ ("N jobs found") without
+    # changing the response body shape (a bare list) that existing clients
+    # depend on.
+    expose_headers=["X-Total-Count"],
 )
 
 app.include_router(auth_router,        prefix="/auth",         tags=["auth"])

@@ -53,6 +53,36 @@ async def main():
     for name, count in totals.items():
         print(f"  {name}: {count}")
 
+    # Stamp last_scraped_at on every user so the dashboard's "Last updated"
+    # reflects reality. Only the in-web scheduler stamped it before, and that
+    # path is off in production (RUN_SCHEDULER_IN_WEB=0) — so the UI showed
+    # "Last updated: Never" forever, reading as "the bot is doing nothing".
+    # Read-modify-write per user keeps every other pref key (incl. encrypted
+    # secrets, which are stored encrypted in place) untouched.
+    try:
+        import json
+        from datetime import datetime, timezone
+        now_iso = datetime.now(timezone.utc).isoformat()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT id, preferences FROM users")
+            for r in rows:
+                p = r["preferences"]
+                if isinstance(p, str):
+                    try:
+                        p = json.loads(p)
+                    except Exception:
+                        p = {}
+                p = p or {}
+                p["last_scraped_at"] = now_iso
+                await conn.execute(
+                    "UPDATE users SET preferences = $1 WHERE id = $2",
+                    json.dumps(p), r["id"],
+                )
+        print(f"  Stamped last_scraped_at for {len(rows)} user(s)")
+    except Exception as e:
+        print(f"  last_scraped_at stamp failed: {type(e).__name__}: {e}")
+
     # Score for every user
     pool = await get_pool()
     async with pool.acquire() as conn:

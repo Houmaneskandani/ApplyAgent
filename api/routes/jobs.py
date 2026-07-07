@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, BackgroundTasks, Request
+from fastapi import APIRouter, Depends, BackgroundTasks, Request, Response
 from api.auth import get_current_user, _rate_limit
 from db import get_pool
 
@@ -95,12 +95,15 @@ def time_ago(dt) -> str:
 
 @router.get("/")
 async def get_jobs(
+    response: Response,
     min_score: int = 1,
     limit: int = 100,
     ats: str | None = None,
     search: str | None = None,
     location: str | None = None,
     category: str | None = None,
+    sort: str = "score",
+    posted_within_days: int | None = None,
     user=Depends(get_current_user),
 ):
     """
@@ -167,6 +170,23 @@ async def get_jobs(
             elif category in _jc.JOB_CATEGORIES:
                 where.append(f"j.category = {_bind(category)}")
 
+        # Freshness window, applied server-side so "Past 24h / 7 days" search
+        # the WHOLE corpus (client-side they could only subtract from the
+        # top-200-by-score, which is dominated by old jobs).
+        if posted_within_days is not None:
+            days = max(1, min(int(posted_within_days), 365))
+            where.append(f"j.created_at >= NOW() - ({_bind(days)} || ' days')::interval")
+
+        # Sort: whitelist-mapped (never interpolate user input). "date" makes
+        # NEW jobs reachable — the all-time score ranking is dominated by old
+        # 8-9s, so without a server-side newest sort a fresh job could NEVER
+        # appear in the capped window. Score ties break newest-first.
+        ORDER_SQL = {
+            "score": "a.score DESC, j.created_at DESC",
+            "date":  "j.created_at DESC, a.score DESC",
+        }
+        order_by = ORDER_SQL.get(sort, ORDER_SQL["score"])
+
         if ats_filter:
             # Same CASE classifier as classify_ats(), applied pre-LIMIT.
             where.append(
@@ -182,19 +202,23 @@ async def get_jobs(
 
         # Always JOIN jobs (cheap PK join) so location/search/ats can filter
         # pre-LIMIT. The SELECTed columns are unchanged, so the response shape
-        # is byte-identical to before.
+        # is byte-identical to before. COUNT(*) OVER() = total matches before
+        # the LIMIT — emitted via the X-Total-Count header ("N jobs found")
+        # so the body stays a bare list for existing clients.
         limit_p = _bind(limit)
         apps = await conn.fetch(
             f"""
-            SELECT a.job_id, a.score, a.status, a.applied_at, a.notes
+            SELECT a.job_id, a.score, a.status, a.applied_at, a.notes,
+                   COUNT(*) OVER() AS _total
               FROM applications a
               JOIN jobs j ON j.id = a.job_id
              WHERE {' AND '.join(where)}
-             ORDER BY a.score DESC
+             ORDER BY {order_by}
              LIMIT {limit_p}
             """,
             *args,
         )
+        response.headers["X-Total-Count"] = str(apps[0]["_total"] if apps else 0)
 
         if not apps:
             return []
