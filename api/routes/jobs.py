@@ -104,6 +104,7 @@ async def get_jobs(
     category: str | None = None,
     sort: str = "score",
     posted_within_days: int | None = None,
+    status: str | None = None,
     user=Depends(get_current_user),
 ):
     """
@@ -137,12 +138,29 @@ async def get_jobs(
         # Assemble the WHERE clause with positional params. EVERY value is
         # bound ($n) — never string-interpolated — so this stays injection-safe
         # exactly like the original ats parameterization.
-        where = ["a.user_id = $1", "a.score >= $2"]
-        args: list = [user_id, min_score]
+        where = ["a.user_id = $1"]
+        args: list = [user_id]
 
         def _bind(val) -> str:
             args.append(val)
             return f"${len(args)}"
+
+        # Status tab filter (Applied / Needs Review), applied pre-LIMIT.
+        # Without it, the tabs filtered client-side over the 200 freshest
+        # top-scored rows — a May-era 'unknown' application could never
+        # appear even though the badge (a DB COUNT) said it existed.
+        VALID_STATUS = {"applied", "unknown", "failed", "new"}
+        status_filter = status if status in VALID_STATUS else None
+        if status_filter == "new":
+            where.append("(a.status IS NULL OR a.status = 'new')")
+        elif status_filter:
+            where.append(f"a.status = {_bind(status_filter)}")
+
+        # Score floor applies to BROWSE views only. History tabs (applied/
+        # unknown/failed) must show every row — manual applies can have a
+        # NULL score, and `score >= 1` would silently hide them.
+        if status_filter in (None, "new"):
+            where.append(f"a.score >= {_bind(min_score)}")
 
         loc = (location or "").strip()
         if loc:
@@ -186,6 +204,9 @@ async def get_jobs(
             "date":  "j.created_at DESC, a.score DESC",
         }
         order_by = ORDER_SQL.get(sort, ORDER_SQL["score"])
+        if status_filter in ("applied", "unknown", "failed"):
+            # Action-history tabs read most-recent-attempt-first.
+            order_by = "a.applied_at DESC NULLS LAST, a.score DESC"
 
         if ats_filter:
             # Same CASE classifier as classify_ats(), applied pre-LIMIT.
