@@ -48,7 +48,18 @@ REJECTION_WORDS = [
 NOISE_WORDS = [
     "job alert", "jobs for you", "recommended jobs", "new jobs matching",
     "newsletter", "digest", "unsubscribe to stop receiving job alerts",
+    # Machine mail from the application flow itself — the applier consumes
+    # these; they're not a human response.
+    "security code for your application", "verification code",
+    "confirm your email",
 ]
+
+# For mail matched ONLY by company name (not an ATS sender), require it to
+# actually be about hiring — otherwise being a CUSTOMER of a company you
+# applied to (e.g. Robinhood brokerage statements) floods the inbox.
+HIRING_SIGNAL = re.compile(
+    r"\b(appl(?:y|ying|ication|ied)|interview|recruit|talent|career|hiring|"
+    r"candidate|position|role|resume|assessment)\b", re.I)
 
 
 def _classify(subject: str, body: str, sender: str) -> str:
@@ -203,6 +214,8 @@ async def scan_user_responses(user_id: int) -> int:
                     break
             if not from_ats and not matched_company:
                 continue  # unrelated mail
+            if not from_ats and not HIRING_SIGNAL.search(hay):
+                continue  # customer/transactional mail from an applied company
             kind = _classify(m["subject"], m["snippet"], m["sender"])
             if kind == "noise":
                 continue

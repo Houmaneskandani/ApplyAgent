@@ -233,18 +233,37 @@ async def auto_apply_for_user(user_id: int) -> int:
         allowlist = _live_apply_allowlist()
         allow_all = "*" in allowlist
 
+        # Dedupe by (company, title): companies re-post the SAME role per
+        # location/board (observed live: 4 identical Brex postings queued in
+        # one day, burning 4 of the 10 daily slots + 1.6 credits on one
+        # effective role). Skip anything we already attempted or queue here.
+        attempted = await conn.fetch("""
+            SELECT DISTINCT LOWER(COALESCE(j.company,'')) c, LOWER(COALESCE(j.title,'')) t
+              FROM applications a JOIN jobs j ON j.id = a.job_id
+             WHERE a.user_id = $1 AND a.status IN ('applied','queued','applying','unknown')
+        """, user_id)
+        seen_pairs = {(r["c"], r["t"]) for r in attempted}
+
         matching: list = []
         skipped_ats: dict = {}
+        skipped_dupes = 0
         for job in candidates:
             if not allow_all:
                 bucket = classify_ats(job["source"], job["url"])
                 if bucket not in allowlist:
                     skipped_ats[bucket] = skipped_ats.get(bucket, 0) + 1
                     continue
+            pair = ((job["company"] or "").lower(), (job["title"] or "").lower())
+            if pair[0] and pair in seen_pairs:
+                skipped_dupes += 1
+                continue
             if _job_passes_saved_filters(dict(job), filters):
+                seen_pairs.add(pair)
                 matching.append(job)
                 if len(matching) >= remaining:
                     break
+        if skipped_dupes:
+            print(f"  [AutoApply] User {user_id}: skipped {skipped_dupes} duplicate company+title posting(s)")
 
         if skipped_ats:
             print(
