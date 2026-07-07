@@ -71,6 +71,29 @@ async def lifespan(app: FastAPI):
         await init_db()
     except Exception as e:
         print(f"[lifespan] init_db failed (continuing): {type(e).__name__}: {e}")
+    # Validate the Anthropic key with a real API call (count_tokens is free).
+    # "Configured" is not "working": an invalid/revoked key silently kills
+    # scoring AND form-filling — we ran ~2 weeks blind because /health only
+    # checked presence. Result surfaces in /health as anthropic.valid.
+    app.state.anthropic_key_valid = None  # None = unknown (network error etc.)
+    async def _validate_anthropic_key():
+        try:
+            import anthropic
+            client = anthropic.AsyncAnthropic()
+            await client.messages.count_tokens(
+                model="claude-haiku-4-5-20251001",
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            app.state.anthropic_key_valid = True
+            print("[lifespan] Anthropic key validated OK")
+        except Exception as e:
+            if "authentication" in type(e).__name__.lower() or "401" in str(e):
+                app.state.anthropic_key_valid = False
+                print("[lifespan] ⚠⚠ ANTHROPIC_API_KEY IS INVALID — scoring and "
+                      "form-filling WILL FAIL. Rotate it in Railway variables. ⚠⚠")
+            else:
+                print(f"[lifespan] Anthropic key check inconclusive: {type(e).__name__}: {e}")
+    tasks.append(asyncio.create_task(_validate_anthropic_key()))
     # ALWAYS run the auto-apply + queue-drain loop in the (long-running) web
     # service. Applies are long Playwright sessions that can only complete in a
     # persistent process — the short-lived cron worker can't run them. This is
@@ -188,9 +211,13 @@ async def health():
         checks["database"] = {"ok": False, "error": type(e).__name__}
         overall_ok = False
 
-    # Required-secret presence (NOT validity — we never call out to verify).
+    # Required-secret presence + (for Anthropic) boot-time validity: a revoked
+    # key silently kills scoring + form-filling, so False here = degraded.
     from config import ANTHROPIC_API_KEY, STRIPE_SECRET_KEY, CAPSOLVER_API_KEY, SECRETS_ENCRYPTION_KEY
-    checks["anthropic"]  = {"configured": bool(ANTHROPIC_API_KEY)}
+    key_valid = getattr(app.state, "anthropic_key_valid", None)
+    checks["anthropic"]  = {"configured": bool(ANTHROPIC_API_KEY), "valid": key_valid}
+    if key_valid is False:
+        overall_ok = False
     checks["stripe"]     = {"configured": bool(STRIPE_SECRET_KEY)}
     checks["capsolver"]  = {"configured": bool(CAPSOLVER_API_KEY)}
     checks["secrets_at_rest"] = {"configured": bool(SECRETS_ENCRYPTION_KEY)}
