@@ -6,7 +6,7 @@ Handles: BambooHR, iCIMS, Rippling, JazzHR, Jobvite, Pinpoint, and any other job
 import asyncio
 import os
 from playwright.async_api import async_playwright
-from applier.greenhouse import get_answer
+from applier.greenhouse import get_answer, set_job_context
 from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 os.makedirs("screenshots", exist_ok=True)
@@ -29,6 +29,7 @@ DIRECT_FIELD_KEYWORDS = {
 async def apply_generic(job: dict, dry_run: bool = True, user_info: dict = None, profile_text: str = None) -> str:
     if not user_info or not profile_text:
         raise ValueError("user_info and profile_text are required")
+    set_job_context(job)  # tailor cover letters / "why here" to THIS job
 
     info = user_info
     print(f"\n  Applying to: {job['title']} @ {job['company']}")

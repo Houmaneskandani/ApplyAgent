@@ -3,7 +3,7 @@ import os
 import anthropic
 from playwright.async_api import async_playwright
 from config import ANTHROPIC_API_KEY
-from applier.greenhouse import get_answer
+from applier.greenhouse import get_answer, set_job_context
 from applier.browser_utils import stealth_session, wait_for_captcha_if_present, trusted_click
 
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -14,6 +14,7 @@ os.makedirs("screenshots", exist_ok=True)
 async def apply_lever(job: dict, dry_run: bool = True, user_info: dict = None, profile_text: str = None):
     if not user_info or not profile_text:
         raise ValueError("user_info and profile_text are required")
+    set_job_context(job)  # tailor cover letters / "why here" to THIS job
     info = user_info
     print(f"\n  Applying to: {job['title']} @ {job['company']}")
     print(f"  URL: {job['url']}")

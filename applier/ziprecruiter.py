@@ -33,7 +33,7 @@ import asyncio
 import os
 from playwright.async_api import async_playwright
 
-from applier.greenhouse import get_answer
+from applier.greenhouse import get_answer, set_job_context
 from applier.browser_utils import stealth_session, trusted_click
 from applier.reviewer import run_pre_submit_review
 
@@ -80,6 +80,7 @@ async def apply_ziprecruiter(
     job: dict, dry_run: bool = True, user_info: dict = None, profile_text: str = None,
 ) -> str:
     info = user_info or {}
+    set_job_context(job)  # tailor cover letters / "why here" to THIS job
     sess = info.get("_ziprecruiter_session")  # {"ua":..., "state":{...}} or None
 
     print(f"\n  Applying to: {job.get('title')} @ {job.get('company')} (ZipRecruiter)")

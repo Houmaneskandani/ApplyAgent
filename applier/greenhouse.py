@@ -62,24 +62,90 @@ def _cache_set(question: str, field_type: str, profile_text: str, answer: str) -
     _ANSWER_CACHE[key] = (answer, time.time())
 
 
+# ── Job context (task-local) ────────────────────────────────────────────────
+# The job being applied to, visible to every get_answer/batch_get_answers call
+# in the SAME application task — so cover letters and "why do you want to work
+# here?" answers are tailored to THIS company instead of generic template text.
+# A ContextVar (not a module global) so concurrent applications for different
+# jobs/users in the same process can never bleed context into each other.
+import contextvars
+_job_ctx: contextvars.ContextVar = contextvars.ContextVar("job_context", default="")
+
+
+def build_job_context(job: dict) -> str:
+    """Compact plain-text description of the job for answer tailoring."""
+    if not job:
+        return ""
+    import re as _re
+    desc = _re.sub(r"<[^>]+>", " ", job.get("description") or "")
+    desc = _re.sub(r"\s+", " ", desc).strip()[:1200]
+    parts = [
+        f"Title: {job.get('title', '')}",
+        f"Company: {job.get('company', '')}",
+    ]
+    if job.get("location"):
+        parts.append(f"Location: {job['location']}")
+    if desc:
+        parts.append(f"Description (excerpt): {desc}")
+    return "\n".join(parts)
+
+
+def set_job_context(job: dict | None) -> None:
+    """Called by each applier at the start of an application."""
+    _job_ctx.set(build_job_context(job) if job else "")
+
+
+def _cache_basis(profile_text: str, field_type: str, job_context: str) -> str:
+    """
+    What the answer cache keys on besides the question. Free-text answers
+    (textarea: cover letters, motivation, behavioral) are tailored per-job, so
+    their cache must include the job — otherwise the SAME cached cover letter
+    would be sent to every company. Factual/choice answers (EEOC, sponsorship,
+    dropdowns) are job-independent and stay globally cached for cost.
+    """
+    if field_type == "textarea" and job_context:
+        return f"{profile_text}\n@@JOB@@\n{job_context}"
+    return profile_text
+
+
 async def get_answer(question: str, field_type: str, profile_text: str = None) -> str:
     if not profile_text:
         raise ValueError("profile_text is required — no hardcoded profile fallback")
     profile = profile_text
+    job_context = _job_ctx.get()
 
     # Cache hit — return without burning a Claude token. EEOC/sponsorship/
     # consent answers are stable across applications for a given profile,
     # so this is a major cost reduction on the second+ application.
-    cached = _cache_get(question, field_type, profile_text)
+    cache_key_text = _cache_basis(profile_text, field_type, job_context)
+    cached = _cache_get(question, field_type, cache_key_text)
     if cached is not None:
         return cached
+
+    job_block = ""
+    if job_context:
+        job_block = f"""
+THE SPECIFIC JOB BEING APPLIED TO:
+{job_context}
+
+TAILORING RULES (because you know the exact job):
+- For motivation questions ("why do you want to work here/at this company"):
+  answer about THIS company by name, referencing what the role/description
+  actually says. Never write an answer that could be sent to any company.
+- For a COVER LETTER request: write 150-220 words. Open with something
+  specific to THIS role/company drawn from the description (never "To Whom
+  It May Concern" or "I am writing to apply"). Connect 2-3 real experiences
+  from the candidate's profile to the job's stated needs. Do NOT invent
+  experience, employers, or skills not in the profile. Close simply with the
+  candidate's name.
+"""
 
     prompt = f"""
 You are an expert job application assistant filling out a form on behalf of this candidate:
 
 {profile}
-
-Your job is to answer ANY question intelligently — whether it's about the candidate's background, 
+{job_block}
+Your job is to answer ANY question intelligently — whether it's about the candidate's background,
 behavioral questions, technical questions, or general questions.
 
 Question: "{question}"
@@ -147,11 +213,13 @@ CRITICAL RULES — you will be penalized for breaking these:
                 await asyncio.sleep(2 ** attempt)  # 2s, 4s backoff
             message = await client.messages.create(
                 model="claude-haiku-4-5-20251001",
-                max_tokens=200,
+                # Textareas can carry a tailored cover letter (~220 words ≈
+                # 300+ tokens) — 200 would truncate it mid-sentence.
+                max_tokens=450 if field_type == "textarea" else 200,
                 messages=[{"role": "user", "content": prompt}],
             )
             answer = message.content[0].text.strip()
-            _cache_set(question, field_type, profile_text, answer)
+            _cache_set(question, field_type, cache_key_text, answer)
             return answer
         except Exception as e:
             err = str(e)
@@ -178,10 +246,23 @@ async def batch_get_answers(questions: list[dict], profile_text: str) -> dict:
         opts = f" Options: {q['options']}" if q.get("options") else ""
         q_lines.append(f'{i+1}. [{q["type"]}] {q["label"]}{opts}')
 
+    job_context = _job_ctx.get()
+    job_block = ""
+    if job_context:
+        job_block = f"""
+THE SPECIFIC JOB BEING APPLIED TO:
+{job_context}
+
+Use this to TAILOR free-text answers: motivation questions ("why this
+company") must reference THIS company/role specifically; cover-letter
+questions get 150-220 words connecting the candidate's real experience to
+this job's stated needs. Never invent experience not in the profile.
+"""
+
     prompt = f"""You are filling out a job application for this candidate:
 
 {profile_text}
-
+{job_block}
 Answer ALL of the following form questions. Reply with a single JSON object where keys are the question numbers (as strings) and values are the answers.
 
 QUESTIONS:
@@ -512,6 +593,7 @@ async def get_frame(page):
 async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = None, profile_text: str = None):
     if not user_info or not profile_text:
         raise ValueError("user_info and profile_text are required")
+    set_job_context(job)  # tailor cover letters / "why here" to THIS job
     from datetime import datetime, timezone
     session_start = datetime.now(timezone.utc)
     info = user_info
