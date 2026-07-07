@@ -364,9 +364,42 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
 
     counters = {"scored": 0, "errored": 0, "skipped": 0}
 
+    # Local commodity categories (warehouse/temp) are scored by RULE, not by
+    # Claude — the fit question is "right title, right place", which a
+    # substring check answers for free. AI-scoring "Warehouse Associate"
+    # against a software résumé costs money AND gets the wrong answer.
+    import job_categories as _jc
+    _local_cat_keys = _jc.local_keys()
+    _user_local_cats = set(prefs.get("job_categories") or []) & _local_cat_keys
+    _local_area_tokens = [
+        t.strip().lower()
+        for t in ((prefs.get("local_job_area") or prefs.get("city") or "").split(","))
+        if t.strip()
+    ]
+
+    def _rule_score_local(job_dict) -> int:
+        """Fixed scores for local commodity jobs: 7 = in the user's area
+        (auto-apply eligible), 5 = right title but area unconfirmed (visible,
+        below the >=6 auto-apply gate)."""
+        loc = (job_dict.get("location") or "").lower()
+        if _local_area_tokens and any(t in loc for t in _local_area_tokens):
+            return 7
+        return 5
+
     async def score_one(job):
         job_dict = dict(job)
         title = job_dict.get("title", "")
+        # Local commodity job (tagged by the scraper that found it): rule-based
+        # score, zero Claude tokens. Only when this user actually opted into
+        # the category — otherwise it's 0 like any other non-target job.
+        if job_dict.get("category") in _local_cat_keys:
+            if job_dict["category"] in _user_local_cats:
+                await upsert_application(user_id, job_dict["id"], _rule_score_local(job_dict))
+                counters["scored"] += 1
+            else:
+                await upsert_application(user_id, job_dict["id"], 0)
+                counters["skipped"] += 1
+            return
         # Pre-filter by title — no AI call needed
         if not is_engineering_job(title):
             await upsert_application(user_id, job_dict["id"], 0)

@@ -82,8 +82,15 @@ async def scrape_jsearch():
 
     # Search the roles the user(s) actually want (set by the scheduler from
     # preferences); falls back to the default software-engineering queries.
+    # Each spec carries its search intent: remote categories keep the
+    # historical "<query> remote"; LOCAL categories (warehouse/temp) search
+    # "<query> in <area>" near the user's home — appending "remote" there
+    # would structurally hide every in-person job.
     import job_categories
-    queries = job_categories.active_queries() or JSEARCH_QUERIES
+    specs = job_categories.active_query_specs() or [
+        {"query": q, "category": None, "local": False} for q in JSEARCH_QUERIES
+    ]
+    local_area = job_categories.local_area()
 
     async with httpx.AsyncClient(
         timeout=20,
@@ -92,12 +99,17 @@ async def scrape_jsearch():
             "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
         },
     ) as client:
-        for query in queries:
+        for spec in specs:
+            query = spec["query"]
+            if spec["local"]:
+                search_q = f"{query} in {local_area}"
+            else:
+                search_q = f"{query} remote"
             try:
                 r = await client.get(
                     "https://jsearch.p.rapidapi.com/search",
                     params={
-                        "query": f"{query} remote",
+                        "query": search_q,
                         "page": "1",
                         "num_pages": "2",
                         "date_posted": "week",
@@ -151,6 +163,10 @@ async def scrape_jsearch():
                         "url": url,
                         "source": source,
                         "description": (job.get("job_description") or "")[:5000],
+                        # Which category's query found this job. Drives the
+                        # dashboard Professional/Warehouse toggle + rule-based
+                        # scoring for local commodity jobs.
+                        "category": spec["category"],
                     })
             except Exception as e:
                 print(f"  JSearch [{query}] error: {e}")

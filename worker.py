@@ -20,6 +20,16 @@ async def main():
     print("=== Worker: scrape + score ===")
     await init_db()
 
+    # Resolve which categories to search + the local area BEFORE scraping.
+    # Without this the cron scraped with the software-only default no matter
+    # what categories users picked (the resolve only lived in scheduler_loop,
+    # which is off in the web service).
+    try:
+        import job_categories
+        await job_categories.resolve_active_from_db()
+    except Exception as e:
+        print(f"  Category resolve failed (using default): {type(e).__name__}: {e}")
+
     print("\n── Scraping ──────────────────────────────")
 
     totals = {}

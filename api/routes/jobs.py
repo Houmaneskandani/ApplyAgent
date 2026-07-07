@@ -100,6 +100,7 @@ async def get_jobs(
     ats: str | None = None,
     search: str | None = None,
     location: str | None = None,
+    category: str | None = None,
     user=Depends(get_current_user),
 ):
     """
@@ -152,6 +153,19 @@ async def get_jobs(
                 f"OR j.company ILIKE '%'||{p}||'%' "
                 f"OR j.location ILIKE '%'||{p}||'%')"
             )
+
+        # Mode toggle: 'professional' = career jobs (everything not discovered
+        # by a local commodity category — includes all historical NULL rows);
+        # a specific category key = only jobs that category's queries found.
+        # Validated against the known key set so the SQL never sees free text.
+        if category:
+            import job_categories as _jc
+            local = sorted(_jc.local_keys())
+            if category == "professional" and local:
+                p = _bind(local)
+                where.append(f"(j.category IS NULL OR NOT (j.category = ANY({p})))")
+            elif category in _jc.JOB_CATEGORIES:
+                where.append(f"j.category = {_bind(category)}")
 
         if ats_filter:
             # Same CASE classifier as classify_ats(), applied pre-LIMIT.

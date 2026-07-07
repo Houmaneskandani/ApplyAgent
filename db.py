@@ -95,6 +95,12 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Which job_categories key DISCOVERED this job (e.g.
+        # 'warehouse_logistics'). NULL = professional/uncategorized (all
+        # historical rows). Lets the dashboard's Professional/Warehouse mode
+        # toggle and the rule-based scorer separate commodity local jobs from
+        # career jobs without guessing from titles.
+        await conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS category TEXT")
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS applications (
                 id SERIAL PRIMARY KEY,
@@ -138,8 +144,8 @@ async def insert_jobs_batch(jobs: list[dict]):
     async with pool.acquire() as conn:
         await conn.executemany(
             """
-            INSERT INTO jobs (title, company, location, url, source, description)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO jobs (title, company, location, url, source, description, category)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (url) DO UPDATE
               SET description = EXCLUDED.description
               WHERE (jobs.description IS NULL OR jobs.description = '')
@@ -153,6 +159,7 @@ async def insert_jobs_batch(jobs: list[dict]):
                     j["url"],
                     j["source"],
                     j.get("description", ""),
+                    j.get("category"),
                 )
                 for j in jobs
             ],
