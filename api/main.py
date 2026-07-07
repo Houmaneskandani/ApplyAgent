@@ -176,6 +176,8 @@ app.include_router(profile_router,     prefix="/profile",      tags=["profile"])
 app.include_router(credits_router,     prefix="/credits",      tags=["credits"])
 app.include_router(queue_router,       prefix="/queue",        tags=["queue"])
 app.include_router(auto_apply_router,  prefix="/auto-apply",   tags=["auto-apply"])
+from api.routes.responses import router as responses_router  # noqa: E402
+app.include_router(responses_router,   prefix="/responses",    tags=["responses"])
 
 
 _BOOT_TIME = time.time()

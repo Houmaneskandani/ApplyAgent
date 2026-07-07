@@ -12,6 +12,7 @@ from scrapers.remotive import scrape_remotive
 # dice/ycombinator/wellfound retired — APIs dead or bot-walled (0 results,
 # log noise). Files kept in scrapers/ for future revival.
 from scrapers.jsearch import scrape_jsearch
+from scrapers.hackernews import scrape_hackernews
 from scrapers.ziprecruiter import scrape_ziprecruiter
 from matcher import score_jobs
 
@@ -39,6 +40,7 @@ async def main():
         ("Himalayas",           scrape_himalayas),
         ("Remotive/Remote.co",  scrape_remotive),
         ("LinkedIn/Indeed",     scrape_jsearch),
+        ("HN Who is hiring",    scrape_hackernews),
         ("ZipRecruiter",        scrape_ziprecruiter),
     ]:
         try:
@@ -95,6 +97,56 @@ async def main():
             await score_jobs(user["id"])
         except Exception as e:
             print(f"    Error scoring user {user['id']}: {e}")
+
+    # Daily digest — at most ONE email per user per day (the cron runs 4x/day;
+    # prefs.digest_last_sent gates it) with the strongest matches scraped in
+    # the last 24h. No matches = no email (never send an empty digest).
+    try:
+        from notifications import _send_email
+        import json as _json
+        from datetime import datetime as _dt, timezone as _tz
+        today = _dt.now(_tz.utc).date().isoformat()
+        async with pool.acquire() as conn:
+            urows = await conn.fetch(
+                "SELECT id, email, name, preferences FROM users WHERE COALESCE(email,'') <> ''")
+            for u in urows:
+                p = u["preferences"]
+                if isinstance(p, str):
+                    try:
+                        p = _json.loads(p)
+                    except Exception:
+                        p = {}
+                p = p or {}
+                if p.get("digest_last_sent") == today:
+                    continue
+                top = await conn.fetch("""
+                    SELECT a.score, j.title, j.company, j.location
+                      FROM applications a JOIN jobs j ON j.id = a.job_id
+                     WHERE a.user_id = $1 AND a.score >= 7
+                       AND COALESCE(a.status, 'new') = 'new'
+                       AND j.created_at > NOW() - INTERVAL '24 hours'
+                     ORDER BY a.score DESC LIMIT 8""", u["id"])
+                if not top:
+                    continue
+                lines = "\n".join(
+                    f"  [{r['score']}/10] {r['title']} @ {r['company']}"
+                    + (f"  ({r['location']})" if r["location"] else "")
+                    for r in top)
+                first = (u["name"] or "there").split(" ")[0]
+                _send_email(
+                    f"☀️ {len(top)} strong new match{'es' if len(top) != 1 else ''} today",
+                    f"Hi {first},\n\nFresh postings from the last 24 hours that "
+                    f"scored 7+ against your profile:\n\n{lines}\n\n"
+                    f"Review and apply: https://apply-agent-frontend.vercel.app/dashboard\n\n"
+                    f"— ApplyAgent",
+                    u["email"])
+                p["digest_last_sent"] = today
+                await conn.execute(
+                    "UPDATE users SET preferences = $1 WHERE id = $2",
+                    _json.dumps(p), u["id"])
+                print(f"  ☀️ Digest sent to user {u['id']} ({len(top)} matches)")
+    except Exception as e:
+        print(f"  Digest failed: {type(e).__name__}: {e}")
 
     # Prune long-expired postings nobody touched. Runs here (the 6h cron), not
     # the always-on API loop, since it's a once-per-cycle housekeeping step.

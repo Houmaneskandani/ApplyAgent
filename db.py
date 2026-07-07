@@ -109,6 +109,25 @@ async def init_db():
         # toggle and the rule-based scorer separate commodity local jobs from
         # career jobs without guessing from titles.
         await conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS category TEXT")
+        # Response Inbox — recruiter replies / interview invites / assessments
+        # found in the user's Gmail (scanned by response_scanner.py).
+        # UNIQUE(user_id, message_id) makes rescans idempotent.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS responses (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                job_id INTEGER REFERENCES jobs(id),
+                message_id TEXT,
+                sender TEXT,
+                subject TEXT,
+                snippet TEXT,
+                kind TEXT,
+                received_at TIMESTAMP,
+                seen BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (user_id, message_id)
+            )
+        """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS applications (
                 id SERIAL PRIMARY KEY,

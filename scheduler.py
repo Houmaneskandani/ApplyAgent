@@ -316,6 +316,7 @@ async def run_scrape_and_score():
     # dice/ycombinator/wellfound retired — APIs dead or bot-walled (0 results,
     # log noise). Files kept in scrapers/ for future revival.
     from scrapers.jsearch import scrape_jsearch
+    from scrapers.hackernews import scrape_hackernews
     from scrapers.ziprecruiter import scrape_ziprecruiter
     from db import get_pool
 
@@ -334,6 +335,7 @@ async def run_scrape_and_score():
         ("Himalayas",    scrape_himalayas),
         ("Remotive",     scrape_remotive),
         ("JSearch",      scrape_jsearch),
+        ("HackerNews",   scrape_hackernews),
         ("ZipRecruiter", scrape_ziprecruiter),
     ]
 
@@ -409,6 +411,15 @@ async def auto_apply_loop():
             cycle_ok = False
             _LOOP_HEARTBEAT["last_error"] = f"auto_apply: {type(e).__name__}: {e}"
             print(f"[AutoApplyLoop] error: {type(e).__name__}: {e}")
+            _capture(e)
+        # Response Inbox: check every user's Gmail for recruiter replies /
+        # interview invites. Cheap (one IMAP login per user w/ creds) and
+        # non-fatal — a Gmail hiccup must not mark the whole cycle failed.
+        try:
+            from response_scanner import scan_all_users
+            await scan_all_users()
+        except Exception as e:
+            print(f"[AutoApplyLoop] response scan failed: {type(e).__name__}: {e}")
             _capture(e)
         if cycle_ok:
             _LOOP_HEARTBEAT["last_ok"] = time.time()
