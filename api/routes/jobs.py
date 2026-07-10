@@ -105,6 +105,7 @@ async def get_jobs(
     sort: str = "score",
     posted_within_days: int | None = None,
     status: str | None = None,
+    title: str | None = None,
     user=Depends(get_current_user),
 ):
     """
@@ -165,6 +166,13 @@ async def get_jobs(
         loc = (location or "").strip()
         if loc:
             where.append(f"j.location ILIKE '%' || {_bind(loc)} || '%'")
+
+        # Role filter — matches the TITLE only (unlike `search`, which also
+        # matches company/location). Powers the dashboard's role selector
+        # ("show me software developer roles").
+        role = (title or "").strip()
+        if role:
+            where.append(f"j.title ILIKE '%' || {_bind(role)} || '%'")
 
         q = (search or "").strip()
         if q:

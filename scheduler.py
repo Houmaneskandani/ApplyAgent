@@ -222,6 +222,22 @@ async def auto_apply_for_user(user_id: int) -> int:
                  LIMIT $3
             """, user_id, MIN_SCORE, pool_size)
 
+            # Dedupe by (company, title): companies re-post the SAME role per
+            # location/board (observed live: 4 identical Brex postings queued
+            # in one day, burning 4 of the 10 daily slots + 1.6 credits on one
+            # effective role). Skip anything we already attempted or queued.
+            # MUST run INSIDE this `async with` block: it originally sat after
+            # the block, calling fetch() on a released connection — which
+            # killed every auto-apply cycle for two days ("cannot call
+            # Connection.fetch(): connection has been released back to the
+            # pool") while the loop heartbeat stayed green.
+            attempted = await conn.fetch("""
+                SELECT DISTINCT LOWER(COALESCE(j.company,'')) c, LOWER(COALESCE(j.title,'')) t
+                  FROM applications a JOIN jobs j ON j.id = a.job_id
+                 WHERE a.user_id = $1 AND a.status IN ('applied','queued','applying','unknown')
+            """, user_id)
+            seen_pairs = {(r["c"], r["t"]) for r in attempted}
+
         if not candidates:
             print(f"  [AutoApply] User {user_id}: no qualifying new jobs (score >= {MIN_SCORE}, status = new)")
             return 0
@@ -232,17 +248,6 @@ async def auto_apply_for_user(user_id: int) -> int:
         from api.routes.jobs import classify_ats
         allowlist = _live_apply_allowlist()
         allow_all = "*" in allowlist
-
-        # Dedupe by (company, title): companies re-post the SAME role per
-        # location/board (observed live: 4 identical Brex postings queued in
-        # one day, burning 4 of the 10 daily slots + 1.6 credits on one
-        # effective role). Skip anything we already attempted or queue here.
-        attempted = await conn.fetch("""
-            SELECT DISTINCT LOWER(COALESCE(j.company,'')) c, LOWER(COALESCE(j.title,'')) t
-              FROM applications a JOIN jobs j ON j.id = a.job_id
-             WHERE a.user_id = $1 AND a.status IN ('applied','queued','applying','unknown')
-        """, user_id)
-        seen_pairs = {(r["c"], r["t"]) for r in attempted}
 
         matching: list = []
         skipped_ats: dict = {}
@@ -321,9 +326,16 @@ async def run_auto_apply():
             try:
                 await auto_apply_for_user(user["id"])
             except Exception as e:
+                # Surface into the heartbeat + Sentry: a per-user failure here
+                # previously only print()ed — auto-apply was dead for two days
+                # while /health showed a green loop.
                 print(f"  [AutoApply] Error for user {user['id']}: {e}")
+                _LOOP_HEARTBEAT["last_error"] = f"auto_apply user {user['id']}: {type(e).__name__}: {e}"
+                _capture(e)
     except Exception as e:
         print(f"[AutoApply] Scheduler error: {e}")
+        _LOOP_HEARTBEAT["last_error"] = f"run_auto_apply: {type(e).__name__}: {e}"
+        _capture(e)
 
 
 async def run_scrape_and_score():
