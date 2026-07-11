@@ -106,6 +106,7 @@ async def get_jobs(
     posted_within_days: int | None = None,
     status: str | None = None,
     title: str | None = None,
+    exclude_attempted: bool = False,
     user=Depends(get_current_user),
 ):
     """
@@ -162,6 +163,23 @@ async def get_jobs(
         # NULL score, and `score >= 1` would silently hide them.
         if status_filter in (None, "new"):
             where.append(f"a.score >= {_bind(min_score)}")
+
+        # "Don't show me what I already applied to" — hides jobs whose exact
+        # company+title matches ANY already-attempted application, catching
+        # duplicate re-postings of the same role (different job id/url), not
+        # just the row itself. Companies routinely re-post per location/board;
+        # without this the user keeps seeing — and can re-apply to — roles
+        # they already submitted to.
+        if exclude_attempted:
+            where.append("""NOT EXISTS (
+                SELECT 1 FROM applications ax
+                  JOIN jobs jx ON jx.id = ax.job_id
+                 WHERE ax.user_id = $1
+                   AND ax.status IN ('applied', 'queued', 'applying')
+                   AND COALESCE(jx.company, '') <> ''
+                   AND LOWER(COALESCE(jx.company, '')) = LOWER(COALESCE(j.company, ''))
+                   AND LOWER(COALESCE(jx.title, '')) = LOWER(COALESCE(j.title, ''))
+            )""")
 
         loc = (location or "").strip()
         if loc:

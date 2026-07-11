@@ -632,6 +632,30 @@ async def apply_to_job(
             if status == "queued":
                 raise HTTPException(status_code=409, detail="This job is already in your queue")
 
+        # DUPLICATE-ROLE guard: companies re-post the SAME role under multiple
+        # job ids/urls (observed live: 4 identical Brex postings in one day).
+        # The same-job_id check above can't catch those. Block a LIVE apply
+        # when another posting with the identical company+title is already
+        # applied/queued/applying. Dry runs stay allowed (harmless rehearsal),
+        # and 'unknown'/'failed' don't block — retrying via a fresh posting is
+        # a legitimate recovery path.
+        if not dry_run and (job["company"] or "").strip():
+            dup = await conn.fetchrow("""
+                SELECT a2.status FROM applications a2
+                  JOIN jobs j2 ON j2.id = a2.job_id
+                 WHERE a2.user_id = $1 AND a2.job_id <> $2
+                   AND a2.status IN ('applied', 'queued', 'applying')
+                   AND LOWER(COALESCE(j2.company, '')) = LOWER($3)
+                   AND LOWER(COALESCE(j2.title, '')) = LOWER($4)
+                 LIMIT 1""",
+                user_id, job_id, (job["company"] or "").strip(), (job["title"] or "").strip())
+            if dup:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"You already {'applied to' if dup['status'] == 'applied' else 'queued'} "
+                            f"this exact role at {job['company']} via another posting — "
+                            f"applying again would duplicate your application."))
+
     from db import add_to_queue
     position = await add_to_queue(user_id, job_id, dry_run)
 
