@@ -83,6 +83,14 @@ def _job_passes_saved_filters(job: dict, filters: dict) -> bool:
     location = (job.get("location") or "").lower()
     description = (job.get("description") or "").lower()
 
+    # 0. Auto-Apply role targeting — TITLE-only match, stricter than keywords
+    # (which also match descriptions: "devops" appears in countless SWE job
+    # descriptions). Empty list = no restriction. Set in FilterPanel's
+    # "🤖 Auto-Apply roles" section; browsing is deliberately unaffected.
+    roles = [r.strip().lower() for r in (filters.get("title_roles") or []) if r and r.strip()]
+    if roles and not any(r in title for r in roles):
+        return False
+
     # 1. Keywords — at least ONE must appear somewhere in title/company/description
     kw = filters.get("keywords") or []
     if kw:
