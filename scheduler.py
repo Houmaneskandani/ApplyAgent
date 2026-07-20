@@ -219,16 +219,56 @@ async def auto_apply_for_user(user_id: int) -> int:
             filters = (prefs_raw or {}).get("dashboard_filters") or {}
 
             pool_size = max(remaining * 5, 30)
-            candidates = await conn.fetch("""
+            # ELIGIBILITY FILTERS RUN IN SQL, BEFORE THE LIMIT. The pool used
+            # to be "top-N by score, then filter in Python" — the same
+            # filter-after-truncation bug the dashboard had: once the top-50
+            # became all duplicates / non-allowlisted ATSes / non-matching
+            # titles, every cycle re-examined the SAME 50 rows and queued
+            # nothing, forever (observed live: 1 apply in 7 days with 476
+            # eligible jobs sitting just below the cutoff).
+            from api.routes.jobs import classify_ats as _classify  # noqa: F401 (parity reference)
+            where = ["a.user_id = $1", "a.status = 'new'", "a.score >= $2"]
+            args: list = [user_id, MIN_SCORE]
+
+            allowlist = _live_apply_allowlist()
+            if "*" not in allowlist:
+                args.append(sorted(allowlist))
+                where.append("""CASE
+                    WHEN j.source = 'greenhouse' OR j.url LIKE '%greenhouse.io%' OR j.url LIKE '%gh_jid%' THEN 'greenhouse'
+                    WHEN j.source = 'lever' OR j.url LIKE '%lever.co%' THEN 'lever'
+                    WHEN j.source = 'ashby' OR j.url LIKE '%ashby.io%' OR j.url LIKE '%ashbyhq.com%' THEN 'ashby'
+                    WHEN j.source = 'smartrecruiters' OR j.url LIKE '%smartrecruiters.com%' THEN 'smartrecruiters'
+                    WHEN j.source = 'workday' OR j.url LIKE '%myworkdayjobs.com%' OR j.url LIKE '%workday.com%' THEN 'workday'
+                    WHEN j.source = 'ziprecruiter' OR j.url LIKE '%ziprecruiter.com%' THEN 'ziprecruiter'
+                    ELSE 'generic' END = ANY($""" + str(len(args)) + """)""")
+
+            # Never re-attempt a company+title we already applied/queued.
+            where.append("""NOT EXISTS (
+                SELECT 1 FROM applications ax JOIN jobs jx ON jx.id = ax.job_id
+                 WHERE ax.user_id = $1
+                   AND ax.status IN ('applied', 'queued', 'applying', 'unknown')
+                   AND COALESCE(jx.company, '') <> ''
+                   AND LOWER(COALESCE(jx.company, '')) = LOWER(COALESCE(j.company, ''))
+                   AND LOWER(COALESCE(jx.title, '')) = LOWER(COALESCE(j.title, '')))""")
+
+            # Role targeting (title-only), applied here so the LIMIT slice is
+            # spent entirely on titles the user actually wants.
+            _roles = [r.strip() for r in (filters.get("title_roles") or []) if r and r.strip()]
+            if _roles:
+                args.append([f"%{r}%" for r in _roles])
+                where.append(f"j.title ILIKE ANY(${len(args)})")
+
+            args.append(pool_size)
+            candidates = await conn.fetch(f"""
                 SELECT a.job_id, a.score,
                        j.title, j.company, j.location, j.description,
                        j.url, j.source
                   FROM applications a
                   JOIN jobs j ON j.id = a.job_id
-                 WHERE a.user_id = $1 AND a.status = 'new' AND a.score >= $2
-                 ORDER BY a.score DESC
-                 LIMIT $3
-            """, user_id, MIN_SCORE, pool_size)
+                 WHERE {' AND '.join(where)}
+                 ORDER BY a.score DESC, j.created_at DESC
+                 LIMIT ${len(args)}
+            """, *args)
 
             # Dedupe by (company, title): companies re-post the SAME role per
             # location/board (observed live: 4 identical Brex postings queued
