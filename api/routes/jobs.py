@@ -183,7 +183,12 @@ async def get_jobs(
 
         loc = (location or "").strip()
         if loc:
-            where.append(f"j.location ILIKE '%' || {_bind(loc)} || '%'")
+            # Metro-aware: "Los Angeles" (or "LA") matches Santa Monica,
+            # Burbank, Irvine, etc. — Indeed-style area matching instead of a
+            # naive substring (which found 37 of the 126 LA-area jobs).
+            from locations import expand_location
+            pats = [f"%{p}%" for p in expand_location(loc)]
+            where.append(f"j.location ILIKE ANY({_bind(pats)})")
 
         # Role filter — matches the TITLE only (unlike `search`, which also
         # matches company/location). Powers the dashboard's role selector

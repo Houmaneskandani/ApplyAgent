@@ -131,15 +131,17 @@ def _job_passes_saved_filters(job: dict, filters: dict) -> bool:
         if not any(i.lower() in hay for i in inds):
             return False
 
-    # 5. Location text input
+    # 5. Location text input — metro-aware, same expansion as GET /jobs/
+    # ("Los Angeles" also matches Santa Monica/Burbank/Irvine/... postings).
     loc_filter = (filters.get("location") or "").strip().lower()
     if loc_filter:
-        if loc_filter not in location:
-            if loc_filter == "remote":
-                from api.routes.jobs import detect_work_arrangement
-                if detect_work_arrangement(title, location, description) != "Remote":
-                    return False
-            else:
+        if loc_filter == "remote":
+            from api.routes.jobs import detect_work_arrangement
+            if detect_work_arrangement(title, location, description) != "Remote":
+                return False
+        else:
+            from locations import expand_location
+            if not any(p in location for p in expand_location(loc_filter)):
                 return False
 
     # 6. Excluded companies — comma-separated substring match on company name
