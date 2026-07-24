@@ -598,10 +598,29 @@ async def apply_to_job(
             raise HTTPException(status_code=404, detail="Job not found")
 
         user_row = await conn.fetchrow(
-            "SELECT resume_url, credits FROM users WHERE id = $1", user_id
+            "SELECT resume_url, credits, preferences FROM users WHERE id = $1", user_id
         )
         if not user_row or not user_row["resume_url"]:
             raise HTTPException(status_code=400, detail="Please upload a resume first")
+
+        # Company blocklist — reject a LIVE apply to a company the user blocked
+        # ("never apply to SpaceX again" after a rejection). Dry runs allowed.
+        if not dry_run:
+            import json as _json
+            _prefs = user_row["preferences"] or {}
+            if isinstance(_prefs, str):
+                try:
+                    _prefs = _json.loads(_prefs)
+                except Exception:
+                    _prefs = {}
+            _blocked = [b.strip().lower() for b in
+                        ((_prefs.get("dashboard_filters") or {}).get("exclude_companies") or "").split(",")
+                        if b.strip()]
+            _comp = (job["company"] or "").lower()
+            if _comp and any(b in _comp for b in _blocked):
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{job['company']} is on your blocked-companies list — unblock it in Filters to apply.")
 
         # Check credits (only for live mode — dry runs are free)
         if not dry_run:

@@ -107,6 +107,7 @@ async def get_jobs(
     status: str | None = None,
     title: str | None = None,
     exclude_attempted: bool = False,
+    exclude_companies: str | None = None,
     user=Depends(get_current_user),
 ):
     """
@@ -180,6 +181,14 @@ async def get_jobs(
                    AND LOWER(COALESCE(jx.company, '')) = LOWER(COALESCE(j.company, ''))
                    AND LOWER(COALESCE(jx.title, '')) = LOWER(COALESCE(j.title, ''))
             )""")
+
+        # Company blocklist — "never apply here again" (e.g. SpaceX after a
+        # rejection with a 6-month re-apply cooldown). Comma-separated,
+        # substring match on company, same semantics as the saved-filter
+        # exclude_companies that auto-apply already honors.
+        blocked = [b.strip().lower() for b in (exclude_companies or "").split(",") if b.strip()]
+        for b in blocked:
+            where.append(f"LOWER(COALESCE(j.company, '')) NOT LIKE '%' || {_bind(b)} || '%'")
 
         loc = (location or "").strip()
         if loc:
