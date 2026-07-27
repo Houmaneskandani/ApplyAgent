@@ -651,6 +651,44 @@ async def apply_to_job(
             if status == "queued":
                 raise HTTPException(status_code=409, detail="This job is already in your queue")
 
+        # COMPANY COOLDOWN: one live application per company per N days
+        # (default 30). Companies rate-limit applicants — SpaceX emailed the
+        # user after several different-role applications tripped their 30-day
+        # cap. Dry runs stay allowed.
+        if not dry_run and (job["company"] or "").strip():
+            from db import company_cooldown_days
+            import json as _json2
+            _p2 = user_row["preferences"] or {}
+            if isinstance(_p2, str):
+                try:
+                    _p2 = _json2.loads(_p2)
+                except Exception:
+                    _p2 = {}
+            _cool = company_cooldown_days(_p2)
+            if _cool > 0:
+                recent = await conn.fetchrow("""
+                    SELECT ac.applied_at, jc.title FROM applications ac
+                      JOIN jobs jc ON jc.id = ac.job_id
+                     WHERE ac.user_id = $1 AND ac.dry_run = false
+                       AND ac.status IN ('applied', 'queued', 'applying', 'unknown')
+                       AND (ac.applied_at IS NULL
+                            OR ac.applied_at > NOW() - ($2 || ' days')::interval)
+                       AND LOWER(COALESCE(jc.company, '')) = LOWER($3)
+                     ORDER BY ac.applied_at DESC NULLS FIRST LIMIT 1""",
+                    user_id, str(_cool), (job["company"] or "").strip())
+                if recent:
+                    when = recent["applied_at"]
+                    days_left = _cool
+                    if when is not None:
+                        from datetime import datetime
+                        days_left = max(1, _cool - (datetime.utcnow() - when).days)
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(f"Company cooldown: you applied to {job['company']} "
+                                f"(“{recent['title']}”) recently. Companies cap "
+                                f"applications — wait ~{days_left} more day(s) before "
+                                f"applying to {job['company']} again."))
+
         # DUPLICATE-ROLE guard: companies re-post the SAME role under multiple
         # job ids/urls (observed live: 4 identical Brex postings in one day).
         # The same-job_id check above can't catch those. Block a LIVE apply

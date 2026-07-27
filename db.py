@@ -4,6 +4,26 @@ from config import DATABASE_URL
 
 _pool = None
 
+# Per-company application cooldown: after ANY live application to a company,
+# every other posting at that company is off-limits for this many days.
+# Companies rate-limit applicants (SpaceX emailed the user after he hit their
+# 30-day cap — the bot had applied to several DIFFERENT SpaceX roles, which
+# the company+title dedupe correctly allowed but the company disallowed).
+# Env-overridable; per-user prefs key company_cooldown_days wins when set.
+try:
+    COMPANY_COOLDOWN_DAYS = int(os.getenv("COMPANY_COOLDOWN_DAYS", "30"))
+except ValueError:
+    COMPANY_COOLDOWN_DAYS = 30
+
+
+def company_cooldown_days(prefs: dict | None) -> int:
+    """Resolve the cooldown for a user: prefs override, else the default."""
+    try:
+        v = int((prefs or {}).get("company_cooldown_days", COMPANY_COOLDOWN_DAYS))
+        return max(0, min(v, 365))
+    except (TypeError, ValueError):
+        return COMPANY_COOLDOWN_DAYS
+
 
 async def get_pool():
     global _pool

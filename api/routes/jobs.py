@@ -181,6 +181,24 @@ async def get_jobs(
                    AND LOWER(COALESCE(jx.company, '')) = LOWER(COALESCE(j.company, ''))
                    AND LOWER(COALESCE(jx.title, '')) = LOWER(COALESCE(j.title, ''))
             )""")
+            # Company cooldown: also hide EVERY posting from a company with a
+            # live application in the last N days — those jobs are
+            # un-actionable (the apply guard would 409 anyway), so showing
+            # them is noise. They reappear automatically when the cooldown
+            # lapses.
+            from db import COMPANY_COOLDOWN_DAYS
+            if COMPANY_COOLDOWN_DAYS > 0:
+                cd = _bind(str(COMPANY_COOLDOWN_DAYS))
+                where.append(f"""NOT EXISTS (
+                    SELECT 1 FROM applications ac
+                      JOIN jobs jc ON jc.id = ac.job_id
+                     WHERE ac.user_id = $1 AND ac.dry_run = false
+                       AND ac.status IN ('applied', 'queued', 'applying', 'unknown')
+                       AND (ac.applied_at IS NULL
+                            OR ac.applied_at > NOW() - ({cd} || ' days')::interval)
+                       AND COALESCE(jc.company, '') <> ''
+                       AND LOWER(jc.company) = LOWER(COALESCE(j.company, ''))
+                )""")
 
         # Company blocklist — "never apply here again" (e.g. SpaceX after a
         # rejection with a 6-month re-apply cooldown). Comma-separated,

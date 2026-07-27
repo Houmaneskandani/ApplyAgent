@@ -253,6 +253,25 @@ async def auto_apply_for_user(user_id: int) -> int:
                    AND LOWER(COALESCE(jx.company, '')) = LOWER(COALESCE(j.company, ''))
                    AND LOWER(COALESCE(jx.title, '')) = LOWER(COALESCE(j.title, '')))""")
 
+            # COMPANY COOLDOWN: one live application per company per N days.
+            # Companies cap applicants (SpaceX: hit their 30-day limit because
+            # we applied to several DIFFERENT SpaceX roles — allowed by the
+            # title dedupe above, disallowed by the company). Queued/applying
+            # rows can have NULL applied_at — treat them as in-cooldown.
+            from db import company_cooldown_days
+            cooldown = company_cooldown_days(prefs_raw)
+            if cooldown > 0:
+                args.append(str(cooldown))
+                cd = f"${len(args)}"
+                where.append(f"""NOT EXISTS (
+                    SELECT 1 FROM applications ac JOIN jobs jc ON jc.id = ac.job_id
+                     WHERE ac.user_id = $1 AND ac.dry_run = false
+                       AND ac.status IN ('applied', 'queued', 'applying', 'unknown')
+                       AND (ac.applied_at IS NULL
+                            OR ac.applied_at > NOW() - ({cd} || ' days')::interval)
+                       AND COALESCE(jc.company, '') <> ''
+                       AND LOWER(jc.company) = LOWER(COALESCE(j.company, '')))""")
+
             # Role targeting (title-only), applied here so the LIMIT slice is
             # spent entirely on titles the user actually wants.
             _roles = [r.strip() for r in (filters.get("title_roles") or []) if r and r.strip()]
@@ -302,6 +321,9 @@ async def auto_apply_for_user(user_id: int) -> int:
         matching: list = []
         skipped_ats: dict = {}
         skipped_dupes = 0
+        batch_companies: set = set()  # ONE application per company per batch —
+        # SQL cooldown can't see rows queued in THIS pass, so without this a
+        # single cycle could queue 10 different roles at the same company.
         for job in candidates:
             if not allow_all:
                 bucket = classify_ats(job["source"], job["url"])
@@ -309,11 +331,13 @@ async def auto_apply_for_user(user_id: int) -> int:
                     skipped_ats[bucket] = skipped_ats.get(bucket, 0) + 1
                     continue
             pair = ((job["company"] or "").lower(), (job["title"] or "").lower())
-            if pair[0] and pair in seen_pairs:
+            if pair[0] and (pair in seen_pairs or pair[0] in batch_companies):
                 skipped_dupes += 1
                 continue
             if _job_passes_saved_filters(dict(job), filters):
                 seen_pairs.add(pair)
+                if pair[0]:
+                    batch_companies.add(pair[0])
                 matching.append(job)
                 if len(matching) >= remaining:
                     break
