@@ -5,6 +5,12 @@ from db import insert_jobs_batch
 from matcher import is_engineering_job
 
 GREENHOUSE_COMPANIES = [
+    # Watchlist — recommended targets with async/take-home-friendly hiring
+    # processes. Board slugs VERIFIED against the public Greenhouse API
+    # (automattic -> 'automatticcareers', sourcegraph -> 'sourcegraph91').
+    # DuckDuckGo is deliberately absent: fully custom careers site, no
+    # public ATS API — manual watch only.
+    "automatticcareers", "calendly", "launchdarkly", "sourcegraph91",
     # Original
     "airbnb", "stripe", "figma", "linear",
     "shopify", "dropbox", "square", "robinhood", "brex",

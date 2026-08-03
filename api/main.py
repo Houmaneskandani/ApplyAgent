@@ -80,17 +80,28 @@ async def lifespan(app: FastAPI):
         try:
             import anthropic
             client = anthropic.AsyncAnthropic()
-            await client.messages.count_tokens(
+            # A REAL 1-token message, not count_tokens: count_tokens is free
+            # and returns 200 even when the ACCOUNT BALANCE is exhausted —
+            # which let a zero-credit outage report "valid: true" while every
+            # actual scoring/form-fill call 400'd. Costs a fraction of a cent.
+            await client.messages.create(
                 model="claude-haiku-4-5-20251001",
+                max_tokens=1,
                 messages=[{"role": "user", "content": "ping"}],
             )
             app.state.anthropic_key_valid = True
-            print("[lifespan] Anthropic key validated OK")
+            print("[lifespan] Anthropic key + billing validated OK")
         except Exception as e:
-            if "authentication" in type(e).__name__.lower() or "401" in str(e):
+            msg = str(e)
+            if "authentication" in type(e).__name__.lower() or "401" in msg:
                 app.state.anthropic_key_valid = False
                 print("[lifespan] ⚠⚠ ANTHROPIC_API_KEY IS INVALID — scoring and "
                       "form-filling WILL FAIL. Rotate it in Railway variables. ⚠⚠")
+            elif "credit balance is too low" in msg or "billing" in msg.lower():
+                app.state.anthropic_key_valid = False
+                print("[lifespan] ⚠⚠ ANTHROPIC ACCOUNT OUT OF CREDITS — scoring and "
+                      "form-filling WILL FAIL. Top up at console.anthropic.com → "
+                      "Plans & Billing. ⚠⚠")
             else:
                 print(f"[lifespan] Anthropic key check inconclusive: {type(e).__name__}: {e}")
     tasks.append(asyncio.create_task(_validate_anthropic_key()))

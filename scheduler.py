@@ -279,6 +279,16 @@ async def auto_apply_for_user(user_id: int) -> int:
                 args.append([f"%{r}%" for r in _roles])
                 where.append(f"j.title ILIKE ANY(${len(args)})")
 
+            # WATCHLIST priority: companies the user specifically targets
+            # (preferences.watchlist_companies) sort FIRST, so an opening at
+            # e.g. Automattic gets a daily slot ahead of an equal-scored job
+            # elsewhere. Empty list = pure score ordering, unchanged.
+            _wl = [w.strip().lower() for w in (prefs_raw or {}).get("watchlist_companies") or [] if w and w.strip()]
+            order_prefix = ""
+            if _wl:
+                args.append([f"%{w}%" for w in _wl])
+                order_prefix = f"(LOWER(COALESCE(j.company, '')) LIKE ANY(${len(args)})) DESC, "
+
             args.append(pool_size)
             candidates = await conn.fetch(f"""
                 SELECT a.job_id, a.score,
@@ -287,7 +297,7 @@ async def auto_apply_for_user(user_id: int) -> int:
                   FROM applications a
                   JOIN jobs j ON j.id = a.job_id
                  WHERE {' AND '.join(where)}
-                 ORDER BY a.score DESC, j.created_at DESC
+                 ORDER BY {order_prefix}a.score DESC, j.created_at DESC
                  LIMIT ${len(args)}
             """, *args)
 
