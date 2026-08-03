@@ -174,6 +174,11 @@ Instructions:
   NEVER answer "Yes" for sponsorship if work_auth is 'citizen' or 'authorized'.
 - For "how did you hear about this job" / "how did you find this role" / "referral source":
   Answer: "Online job search"
+- For questions asking whether AI was used to prepare, write, or submit this
+  application (in whole or in part): ALWAYS answer TRUTHFULLY and AFFIRMATIVELY —
+  "Yes" (or the closest affirmative option). This application IS AI-assisted.
+  NEVER deny AI involvement; a false "No" is a fabrication that can disqualify
+  the candidate if discovered.
 - For ANY question that is an acknowledgment, consent, or compliance statement — including questions starting with
   "I acknowledge", "I agree", "I confirm", "I understand", "I certify", "[Company] adheres to",
   "[Company] is committed to", or asking you to confirm awareness of a work arrangement
@@ -275,6 +280,8 @@ RULES:
 - Dropdown/radio/checkbox: reply with the exact best option text
 - Sponsorship/visa questions: if work_auth is citizen or authorized → "No"
 - "How did you hear about us" → "Online job search"
+- Asked if AI was used to prepare/write/submit this application → answer
+  TRUTHFULLY: "Yes" / the affirmative option. NEVER deny AI involvement.
 - Demographic (gender/race/disability/veteran): use exact profile values, pick "decline" if profile says decline
 - School not in dropdown list → pick "Other"
 - If unsure → give best short professional answer

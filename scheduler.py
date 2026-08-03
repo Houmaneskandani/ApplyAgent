@@ -279,6 +279,17 @@ async def auto_apply_for_user(user_id: int) -> int:
                 args.append([f"%{r}%" for r in _roles])
                 where.append(f"j.title ILIKE ANY(${len(args)})")
 
+            # MANUAL-ONLY companies: visible + scored + watchlisted, but the
+            # BOT never auto-applies. Automattic's form embeds an anti-bot
+            # attention test ("follow the instructions at <url>") plus five
+            # required essays — an automated submission there would both fail
+            # the test and disrespect a process built for thoughtful humans.
+            # Manual applies from the dashboard remain fully allowed.
+            _manual_only = [m.strip().lower() for m in (prefs_raw or {}).get("manual_only_companies") or [] if m and m.strip()]
+            if _manual_only:
+                args.append([f"%{m}%" for m in _manual_only])
+                where.append(f"NOT (LOWER(COALESCE(j.company, '')) LIKE ANY(${len(args)}))")
+
             # WATCHLIST priority: companies the user specifically targets
             # (preferences.watchlist_companies) sort FIRST, so an opening at
             # e.g. Automattic gets a daily slot ahead of an equal-scored job
