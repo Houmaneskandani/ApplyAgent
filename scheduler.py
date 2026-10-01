@@ -561,38 +561,19 @@ async def _sweep_zombie_applications():
     limit and (for live applies) holding a reserved 0.4 credit that never got
     refunded. This runs in the always-on loop and catches every user.
 
-    Mirrors the 15-minute predicate in queue.py (applied_at = apply-start).
-    Marks failed AND refunds reserved credits for live rows in one pass, using
-    RETURNING so a row is refunded exactly once (can't double-refund).
+    Shares db.fail_stuck_applications with GET /queue (same 15-minute
+    predicate on applied_at = apply-start). Refunds go through
+    refund_reservation, which flips the row's credit_reserved flag atomically
+    so a reservation is refunded exactly once no matter which safety net
+    gets there first.
     """
-    from db import get_pool, add_credits
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        swept = await conn.fetch("""
-            UPDATE applications
-            SET status = 'failed',
-                notes = 'Timed out — no response after 15 minutes'
-            WHERE status = 'applying'
-              AND applied_at < NOW() - INTERVAL '15 minutes'
-            RETURNING user_id, dry_run
-        """)
-    if not swept:
-        return
-    # Refund the upfront 0.4 reservation for LIVE rows only (dry-runs never
-    # reserved). Aggregate per user so we do one UPDATE per affected user.
-    refunds: dict = {}
-    for r in swept:
-        if not r["dry_run"]:
-            refunds[r["user_id"]] = refunds.get(r["user_id"], 0) + 1
-    for uid, n in refunds.items():
-        try:
-            await add_credits(uid, 0.4 * n)
-        except Exception as e:
-            print(f"[ZombieSweep] refund failed for user {uid}: {type(e).__name__}: {e}")
-    print(
-        f"[ZombieSweep] reset {len(swept)} stuck 'applying' row(s); "
-        f"refunded {sum(refunds.values())} live credit-reservation(s)"
-    )
+    from db import fail_stuck_applications
+    result = await fail_stuck_applications()
+    if result["failed"]:
+        print(
+            f"[ZombieSweep] reset {result['failed']} stuck 'applying' row(s); "
+            f"refunded {result['refunded']} credit reservation(s)"
+        )
 
 
 async def scheduler_loop():

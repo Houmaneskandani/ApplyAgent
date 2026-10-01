@@ -118,8 +118,12 @@ def _text_snippet(msg) -> str:
 
 
 def _fetch_messages(imap_user: str, imap_pass: str, since: datetime) -> list[dict]:
-    """Blocking IMAP fetch — run in an executor. Returns raw message dicts."""
-    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+    """Blocking IMAP fetch — run in an executor. Returns raw message dicts.
+
+    The socket timeout is essential: without it a hung Gmail connection
+    blocks this executor thread forever, and scan_all_users (awaited by the
+    auto-apply loop) stalls with it."""
+    mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
     try:
         mail.login(imap_user, imap_pass)
         mail.select("INBOX", readonly=True)  # never mutate the user's inbox

@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from api.auth import get_current_user, _rate_limit
-from db import get_pool
+from db import get_pool, refund_reservation, fail_stuck_applications
 from applier.browser_utils import throttle_for_url
 
 router = APIRouter()
@@ -128,6 +128,14 @@ async def process_user_queue(user_id: int):
                         UPDATE applications SET status = 'failed', notes = 'Timed out after 10 minutes'
                         WHERE user_id = $1 AND job_id = $2
                     """, user_id, row["job_id"])
+                # run_application refunds on CancelledError; this is the
+                # belt-and-braces path in case that await couldn't complete.
+                # Idempotent — a no-op if the refund already happened.
+                try:
+                    if await refund_reservation(user_id, row["job_id"]):
+                        print(f"  ↩ Refunded credit reservation after timeout (job {row['job_id']})")
+                except Exception as _re:
+                    print(f"  ⚠ Timeout refund failed: {type(_re).__name__}: {_re}")
             except Exception as e:
                 print(f"  ✗ Queue processor error: {e}")
                 pool = await get_pool()
@@ -142,21 +150,20 @@ async def process_user_queue(user_id: int):
 async def get_queue(user=Depends(get_current_user)):
     """Get the current queue (queued + applying) for the logged-in user."""
     user_id = user["user_id"]
+    # Auto-reset any jobs stuck in 'applying' for more than 15 minutes.
+    # This is the SAFETY NET — APPLICATION_TIMEOUT (10 min) should catch
+    # everything first, but if the worker crashed mid-apply and never
+    # updated status, this stops the row from staying 'applying' forever.
+    # Shared with the global zombie sweep so it ALSO refunds the reserved
+    # credit (this per-user sweep used to mark failed without refunding, and
+    # because the dashboard polls /queue every few seconds it won the race
+    # against the refund-aware sweep nearly every time).
+    try:
+        await fail_stuck_applications(user_id=user_id)
+    except Exception as e:
+        print(f"  ⚠ /queue stuck-sweep failed user={user_id}: {type(e).__name__}: {e}")
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Auto-reset any jobs stuck in 'applying' for more than 15 minutes.
-        # This is the SAFETY NET — APPLICATION_TIMEOUT (10 min) should catch
-        # everything first, but if the worker crashed mid-apply and never
-        # updated status, this stops the row from staying 'applying' forever.
-        # Use applied_at (set to NOW() when we started applying) not created_at.
-        await conn.execute("""
-            UPDATE applications
-            SET status = 'failed', notes = 'Timed out — no response after 15 minutes'
-            WHERE user_id = $1
-              AND status = 'applying'
-              AND applied_at < NOW() - INTERVAL '15 minutes'
-        """, user_id)
-
         rows = await conn.fetch("""
             SELECT a.job_id, a.status, a.queue_position, a.dry_run, a.notes,
                    j.title, j.company, j.source

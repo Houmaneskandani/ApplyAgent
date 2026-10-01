@@ -78,6 +78,13 @@ async def init_db():
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS resume_url TEXT")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token TEXT")
         await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_token_expires TIMESTAMP")
+        # Wrong-code counter for the 6-digit reset code: the token is
+        # invalidated after MAX_RESET_ATTEMPTS so the ~1M code space can't be
+        # brute-forced by rotating source IPs around the per-IP rate limit.
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS reset_attempts INTEGER DEFAULT 0")
+        # Set on every password change; JWTs issued (iat) before it are
+        # rejected, so a reset actually logs out whoever held the old token.
+        await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_changed_at TIMESTAMP")
         # Default free credits for new signups. Kept modest (25 ≈ 60 applies)
         # to limit throwaway-email farming until email verification lands.
         # Existing users keep whatever balance they already have.
@@ -97,19 +104,6 @@ async def init_db():
                 event_id TEXT PRIMARY KEY,
                 processed_at TIMESTAMP DEFAULT NOW()
             )
-        """)
-        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS queue_position INTEGER DEFAULT 0")
-        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS dry_run BOOLEAN DEFAULT TRUE")
-        # `force_submit` is a one-shot flag: the /force-submit endpoint sets
-        # it to TRUE when the user overrides a reviewer-blocked apply
-        # ("Submit anyway"). run_application reads-and-clears it atomically
-        # at the start of each attempt so it can't accidentally persist
-        # across normal retries.
-        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS force_submit BOOLEAN DEFAULT FALSE")
-        # Reset any jobs that were mid-apply when server last restarted
-        await conn.execute("""
-            UPDATE applications SET status = 'failed', notes = 'Server restarted during apply'
-            WHERE status = 'applying'
         """)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS jobs (
@@ -161,6 +155,30 @@ async def init_db():
                 UNIQUE(user_id, job_id)
             )
         """)
+        # Schema evolution for `applications` runs AFTER the CREATE above so a
+        # brand-new database (local dev, a fresh environment, integration
+        # tests) initializes cleanly — it used to ALTER before CREATE and
+        # fail with "relation applications does not exist".
+        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS queue_position INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS dry_run BOOLEAN DEFAULT TRUE")
+        # `force_submit` is a one-shot flag: the /force-submit endpoint sets
+        # it to TRUE when the user overrides a reviewer-blocked apply
+        # ("Submit anyway"). run_application reads-and-clears it atomically
+        # at the start of each attempt so it can't accidentally persist
+        # across normal retries.
+        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS force_submit BOOLEAN DEFAULT FALSE")
+        # `credit_reserved` is TRUE while a live apply holds the upfront 0.4
+        # credit reservation. Every refund path flips it FALSE atomically
+        # (refund_reservation) so a reservation can be refunded AT MOST ONCE,
+        # no matter how many safety nets (timeout handler, zombie sweep,
+        # error handler) observe the same failed row.
+        await conn.execute("ALTER TABLE applications ADD COLUMN IF NOT EXISTS credit_reserved BOOLEAN DEFAULT FALSE")
+        # NOTE: this used to blanket-reset every 'applying' row to 'failed'
+        # ("Server restarted during apply") — WITHOUT refunding the reserved
+        # credit, and it ran from the cron worker too (every 6h), which marked
+        # the web service's genuinely in-flight applies as failed. Stuck rows
+        # are now handled by fail_stuck_applications() (refund-aware, age
+        # gated) from the API boot + the periodic zombie sweep instead.
         print("  Database initialized.")
 
 
@@ -421,6 +439,146 @@ async def add_credits(user_id: int, amount: float):
             "UPDATE users SET credits = COALESCE(credits, 0) + $1 WHERE id = $2",
             amount, user_id,
         )
+
+
+LIVE_APPLY_CREDIT = 0.4
+
+
+async def reserve_credit(user_id: int, job_id: int, amount: float = LIVE_APPLY_CREDIT) -> bool:
+    """
+    Reserve `amount` credits for a live apply of `job_id`: atomically deduct
+    from the user's balance AND mark the application row `credit_reserved`.
+    Returns False (nothing deducted) if the balance is insufficient.
+
+    Both statements run in ONE transaction so a crash between them can't
+    leave a deducted credit with no reservation flag (which would make it
+    un-refundable).
+    """
+    if amount <= 0:
+        return True
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """
+                UPDATE users
+                   SET credits = credits - $1
+                 WHERE id = $2 AND COALESCE(credits, 0) >= $1
+                RETURNING credits
+                """,
+                amount, user_id,
+            )
+            if row is None:
+                return False
+            # Upsert so a caller without a pre-existing row (e.g. a one-off
+            # script) still gets a refundable reservation.
+            await conn.execute(
+                """
+                INSERT INTO applications (user_id, job_id, status, credit_reserved)
+                VALUES ($1, $2, 'applying', TRUE)
+                ON CONFLICT (user_id, job_id) DO UPDATE SET credit_reserved = TRUE
+                """,
+                user_id, job_id,
+            )
+            return True
+
+
+async def refund_reservation(user_id: int, job_id: int, amount: float = LIVE_APPLY_CREDIT) -> bool:
+    """
+    Refund the reserved credit for (user_id, job_id) EXACTLY ONCE.
+
+    The conditional UPDATE on `credit_reserved = TRUE` is the lock: only the
+    first caller flips the flag and gets a RETURNING row, so concurrent
+    safety nets (apply error handler, timeout/cancel handler, zombie sweep,
+    GET /queue sweep) can never double-refund. Returns True if a refund was
+    actually issued.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            claimed = await conn.fetchrow(
+                """
+                UPDATE applications SET credit_reserved = FALSE
+                 WHERE user_id = $1 AND job_id = $2 AND credit_reserved = TRUE
+                RETURNING id
+                """,
+                user_id, job_id,
+            )
+            if claimed is None:
+                return False
+            await conn.execute(
+                "UPDATE users SET credits = COALESCE(credits, 0) + $1 WHERE id = $2",
+                amount, user_id,
+            )
+            return True
+
+
+async def consume_reservation(user_id: int, job_id: int) -> None:
+    """The apply succeeded: the reservation becomes the charge. Clear the
+    flag so no later safety net can refund it."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE applications SET credit_reserved = FALSE WHERE user_id = $1 AND job_id = $2",
+            user_id, job_id,
+        )
+
+
+async def fail_stuck_applications(
+    user_id: int | None = None,
+    older_than_minutes: int = 15,
+    note: str = "Timed out — no response after 15 minutes",
+) -> dict:
+    """
+    Mark rows stuck in 'applying' for more than `older_than_minutes` as
+    failed AND refund their reserved credit (once — see refund_reservation).
+
+    `applied_at` is set to NOW() when the queue drainer claims a row, so it
+    is the apply START time. Scoped to one user when `user_id` is given
+    (GET /queue), global otherwise (zombie sweep + API boot).
+
+    The age gate matters on boot: Railway overlaps the old and new instance
+    during a deploy, so a row younger than the gate may still be a LIVE apply
+    on the outgoing process. Those are picked up by the next periodic sweep.
+    Returns {"failed": n, "refunded": m}.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if user_id is None:
+            rows = await conn.fetch(
+                """
+                UPDATE applications
+                   SET status = 'failed', notes = $1
+                 WHERE status = 'applying'
+                   AND applied_at < NOW() - make_interval(mins => $2::int)
+                RETURNING user_id, job_id
+                """,
+                note, older_than_minutes,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                UPDATE applications
+                   SET status = 'failed', notes = $1
+                 WHERE status = 'applying'
+                   AND user_id = $3
+                   AND applied_at < NOW() - make_interval(mins => $2::int)
+                RETURNING user_id, job_id
+                """,
+                note, older_than_minutes, user_id,
+            )
+    refunded = 0
+    for r in rows:
+        try:
+            if await refund_reservation(r["user_id"], r["job_id"]):
+                refunded += 1
+        except Exception as e:
+            print(f"[StuckSweep] refund failed user={r['user_id']} job={r['job_id']}: "
+                  f"{type(e).__name__}: {e}")
+    if rows:
+        print(f"[StuckSweep] failed {len(rows)} stuck 'applying' row(s), "
+              f"refunded {refunded} credit reservation(s)")
+    return {"failed": len(rows), "refunded": refunded}
 
 
 async def add_to_queue(user_id: int, job_id: int, dry_run: bool) -> int:

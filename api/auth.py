@@ -3,9 +3,11 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from passlib.context import CryptContext
 from jose import jwt, JWTError
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from db import get_pool
+import asyncio
 import os
+import time as _time
 import secrets as _secrets
 
 # SECURITY: rate-limit auth endpoints. Without these limits, a 6-digit reset
@@ -70,19 +72,80 @@ class LoginRequest(BaseModel):
     password: str
 
 def create_token(user_id: int, email: str) -> str:
+    now = datetime.now(timezone.utc)
     payload = {
         "user_id": user_id,
         "email": email,
-        "exp": datetime.utcnow() + timedelta(hours=TOKEN_EXPIRE_HOURS)
+        # Whole seconds. Compared against users.password_changed_at (floored
+        # to seconds too) so a login in the same second as a reset still works.
+        "iat": int(now.timestamp()),
+        "exp": now + timedelta(hours=TOKEN_EXPIRE_HOURS),
     }
     return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+# users.password_changed_at, cached per user_id for a short TTL so token
+# validation doesn't add a DB round-trip to EVERY request. reset_password
+# updates the cache in-process immediately; other processes converge within
+# the TTL (worst case: an old token survives ~60s longer on another worker).
+_PW_CHANGED_TTL = 60.0
+_pw_changed_cache: dict[int, tuple[int | None, float]] = {}
+
+
+def _remember_password_changed(user_id: int, changed_at: datetime | None) -> int | None:
+    ts = None
+    if changed_at is not None:
+        if changed_at.tzinfo is None:
+            changed_at = changed_at.replace(tzinfo=timezone.utc)
+        ts = int(changed_at.timestamp())
+    _pw_changed_cache[user_id] = (ts, _time.monotonic())
+    return ts
+
+
+async def _password_changed_ts(user_id: int) -> int | None:
+    hit = _pw_changed_cache.get(user_id)
+    if hit and _time.monotonic() - hit[1] < _PW_CHANGED_TTL:
+        return hit[0]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT password_changed_at FROM users WHERE id = $1", user_id
+        )
+    return _remember_password_changed(user_id, row["password_changed_at"] if row else None)
+
+
+def token_issued_before_password_change(iat, changed_ts) -> bool:
+    """Pure helper (unit-tested): a token is stale when it was issued strictly
+    before the (second-floored) password change."""
+    if iat is None or changed_ts is None:
+        return False
+    try:
+        return int(iat) < int(changed_ts)
+    except (TypeError, ValueError):
+        return False
+
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        return {"user_id": payload["user_id"], "email": payload["email"]}
-    except JWTError:
+        user = {"user_id": payload["user_id"], "email": payload["email"]}
+    except (JWTError, KeyError):
         raise HTTPException(status_code=401, detail="Invalid token")
+    # Reject tokens minted before the user's last password reset. Tokens from
+    # before this check shipped carry no `iat` and are accepted until they
+    # expire (7 days) — no forced re-login on deploy.
+    iat = payload.get("iat")
+    if iat is not None:
+        try:
+            changed_ts = await _password_changed_ts(user["user_id"])
+        except Exception as e:
+            # Fail OPEN on a DB hiccup: the request itself will surface the
+            # DB error; we don't want a blip to read as "logged out".
+            print(f"  ⚠ password_changed_at lookup failed user={user['user_id']}: {type(e).__name__}: {e}")
+            changed_ts = None
+        if token_issued_before_password_change(iat, changed_ts):
+            raise HTTPException(status_code=401, detail="Session expired — please log in again")
+    return user
 
 @router.post("/signup")
 @_rate_limit("5/minute")
@@ -147,21 +210,52 @@ async def forgot_password(request: Request, req: ForgotPasswordRequest):
         expires = datetime.utcnow() + timedelta(minutes=15)
 
         await conn.execute(
-            "UPDATE users SET reset_token = $1, reset_token_expires = $2 WHERE id = $3",
+            "UPDATE users SET reset_token = $1, reset_token_expires = $2, reset_attempts = 0 WHERE id = $3",
             code, expires, user["id"]
         )
 
         # Print to stdout only OUTSIDE production. Logging reset codes to Railway
         # makes them visible to anyone with log access.
-        from config import IS_PROD
+        from config import IS_PROD, SMTP_USER, SMTP_PASS
         if not IS_PROD:
             print(f"\n{'='*40}")
             print(f"  PASSWORD RESET CODE for {req.email}")
             print(f"  Code: {code}  (expires in 15 min)")
             print(f"{'='*40}\n")
-        # TODO: send via SMTP/Twilio in production.
+
+    # Email the code (the only delivery channel in production). _send_email is
+    # a blocking smtplib call with its own 20s timeout — run it in a thread so
+    # the request returns immediately and the event loop isn't held.
+    if SMTP_USER and SMTP_PASS:
+        from notifications import _send_email
+        first = (user["name"] or "there").split(" ")[0]
+        body = (
+            f"Hi {first},\n\n"
+            f"Your ApplyAgent password reset code is:\n\n"
+            f"    {code}\n\n"
+            f"It expires in 15 minutes. If you didn't request a reset, you can "
+            f"ignore this email — your password won't change.\n\n"
+            f"— ApplyAgent"
+        )
+        _spawn_bg(asyncio.to_thread(_send_email, "Your ApplyAgent password reset code", body, req.email))
+    else:
+        print("  ⚠ /forgot-password: SMTP_USER/SMTP_PASS not set — reset code was NOT emailed")
 
     return {"status": "If that email exists, a reset code has been sent"}
+
+
+MAX_RESET_ATTEMPTS = 5
+
+# Strong references for fire-and-forget tasks: asyncio only keeps a weak ref
+# to a task, so a bare create_task() can be garbage-collected mid-flight.
+_bg_tasks: set = set()
+
+
+def _spawn_bg(coro) -> asyncio.Task:
+    t = asyncio.create_task(coro)
+    _bg_tasks.add(t)
+    t.add_done_callback(_bg_tasks.discard)
+    return t
 
 
 @router.post("/reset-password")
@@ -176,21 +270,60 @@ async def reset_password(request: Request, req: ResetPasswordRequest):
         if not user or not user["reset_token"]:
             raise HTTPException(status_code=400, detail="Invalid or expired reset code")
 
+        if user["reset_token_expires"] is None or datetime.utcnow() > user["reset_token_expires"]:
+            raise HTTPException(status_code=400, detail="Reset code has expired. Please request a new one.")
+
         # Constant-time compare so the 6-digit code can't be brute-forced via
         # response-timing (the != short-circuits on the first wrong digit).
-        if not _secrets.compare_digest(str(user["reset_token"]), str(req.code)):
+        if not _secrets.compare_digest(str(user["reset_token"]), str(req.code or "")):
+            # Per-ACCOUNT attempt cap. The per-IP rate limit alone is not a
+            # defense (IPs rotate); after MAX_RESET_ATTEMPTS wrong guesses the
+            # code is burned and the user must request a new one.
+            row = await conn.fetchrow(
+                """
+                UPDATE users SET reset_attempts = COALESCE(reset_attempts, 0) + 1
+                 WHERE id = $1
+                RETURNING reset_attempts
+                """,
+                user["id"],
+            )
+            attempts = (row["reset_attempts"] if row else 0) or 0
+            if attempts >= MAX_RESET_ATTEMPTS:
+                await conn.execute(
+                    "UPDATE users SET reset_token = NULL, reset_token_expires = NULL, reset_attempts = 0 WHERE id = $1",
+                    user["id"],
+                )
+                raise HTTPException(
+                    status_code=400,
+                    detail="Too many incorrect attempts. Please request a new reset code.",
+                )
             raise HTTPException(status_code=400, detail="Invalid or expired reset code")
 
-        if datetime.utcnow() > user["reset_token_expires"]:
-            raise HTTPException(status_code=400, detail="Reset code has expired. Please request a new one.")
+        if len(req.new_password or "") < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
         # SECURITY: apply the SAME 72-byte truncation as signup/login.
         # Without this, a long password set via reset would be saved as bcrypt(full)
         # but login truncates to 72 bytes and the comparison would fail.
         hashed = pwd_context.hash(_bcrypt_prep(req.new_password))
+        # Python-side UTC timestamp (like reset_token_expires), NOT NOW(): the
+        # column is a naive TIMESTAMP and NOW() would be rendered in the DB
+        # session's timezone, which get_current_user then reads as UTC.
+        changed_at = datetime.utcnow()
         await conn.execute(
-            "UPDATE users SET password_hash = $1, reset_token = NULL, reset_token_expires = NULL WHERE id = $2",
-            hashed, user["id"]
+            """
+            UPDATE users
+               SET password_hash = $1,
+                   reset_token = NULL,
+                   reset_token_expires = NULL,
+                   reset_attempts = 0,
+                   password_changed_at = $3
+             WHERE id = $2
+            """,
+            hashed, user["id"], changed_at,
         )
+        # Invalidate every JWT issued before now (see get_current_user), and
+        # prime the in-process cache so it takes effect on the next request.
+        _remember_password_changed(user["id"], changed_at)
 
     return {"status": "Password updated successfully"}

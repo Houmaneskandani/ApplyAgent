@@ -71,6 +71,15 @@ async def lifespan(app: FastAPI):
         await init_db()
     except Exception as e:
         print(f"[lifespan] init_db failed (continuing): {type(e).__name__}: {e}")
+    # Boot recovery for rows left in 'applying' by the previous process.
+    # Refund-aware and age-gated (15 min): Railway overlaps old and new
+    # instances during a deploy, so a young 'applying' row may still be a
+    # live apply on the outgoing process — the periodic sweep gets it later.
+    try:
+        from db import fail_stuck_applications
+        await fail_stuck_applications(note="Server restarted during apply")
+    except Exception as e:
+        print(f"[lifespan] stuck-apply sweep failed (continuing): {type(e).__name__}: {e}")
     # Validate the Anthropic key with a real API call (count_tokens is free).
     # "Configured" is not "working": an invalid/revoked key silently kills
     # scoring AND form-filling — we ran ~2 weeks blind because /health only
