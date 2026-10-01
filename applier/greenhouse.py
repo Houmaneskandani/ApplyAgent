@@ -349,6 +349,9 @@ Reply ONLY with valid JSON. No explanation. No markdown. Example:
     return {}
 
 
+IMAP_SOCKET_TIMEOUT = 30  # seconds — a hung Gmail socket must never block forever
+
+
 async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_uids: set = None, company: str = None, imap_user: str = None, imap_pass: str = None) -> tuple[str, bytes] | tuple[None, None]:
     """
     Poll Gmail via IMAP for a Greenhouse verification code.
@@ -357,7 +360,20 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
     Only accepts emails received at or after since_dt (2-minute buffer for clock skew).
     If company is provided, only accepts emails whose subject contains the company name.
     Uses per-user imap_user/imap_pass if provided, falls back to global SMTP_USER/SMTP_PASS.
+
+    imaplib is synchronous. The polling (up to `wait_sec` of login/search/
+    fetch calls) runs in a worker thread via asyncio.to_thread so the event
+    loop — every API request, /health, the queue drainer and the
+    APPLICATION_TIMEOUT watchdog — keeps running while we wait for Gmail.
     """
+    return await asyncio.to_thread(
+        _read_email_verification_code_blocking,
+        wait_sec, since_dt, used_uids, company, imap_user, imap_pass,
+    )
+
+
+def _read_email_verification_code_blocking(wait_sec: int = 90, since_dt=None, used_uids: set = None, company: str = None, imap_user: str = None, imap_pass: str = None) -> tuple[str, bytes] | tuple[None, None]:
+    """Blocking body of read_email_verification_code — call via to_thread."""
     import imaplib
     import email as _email
     import email.utils as _eutils
@@ -391,7 +407,7 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
     POLL_INTERVAL = 8  # was 5 — slow down a bit to be even gentler on Gmail
     ticks_total = max(1, wait_sec // POLL_INTERVAL)
     for tick in range(ticks_total):
-        await asyncio.sleep(POLL_INTERVAL)
+        time.sleep(POLL_INTERVAL)  # worker thread — never asyncio.sleep here
         elapsed += POLL_INTERVAL
         print(f"    ⏳ [{elapsed}s] Checking inbox...")
         try:
@@ -399,7 +415,7 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
             # FIRST tick (or after a connection error). Calling NOOP keeps
             # the connection alive without re-authenticating.
             if mail is None:
-                mail = imaplib.IMAP4_SSL("imap.gmail.com")
+                mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=IMAP_SOCKET_TIMEOUT)
                 mail.login(imap_user, imap_pass)
                 # INBOX first — verification emails should always be there
                 # because they're transactional. Some accounts have "Show
@@ -415,7 +431,7 @@ async def read_email_verification_code(wait_sec: int = 90, since_dt=None, used_u
                     mail.noop()
                 except Exception:
                     # Connection dropped — start fresh
-                    mail = imaplib.IMAP4_SSL("imap.gmail.com")
+                    mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=IMAP_SOCKET_TIMEOUT)
                     mail.login(imap_user, imap_pass)
                     mail.select("INBOX", readonly=False)
 

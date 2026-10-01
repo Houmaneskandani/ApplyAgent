@@ -1,6 +1,10 @@
 from fastapi import APIRouter, Depends, BackgroundTasks, HTTPException, Request
 from api.auth import get_current_user, _rate_limit
-from db import get_pool, update_application_status, get_user_credits, deduct_credits
+from db import (
+    get_pool, update_application_status, get_user_credits, deduct_credits,
+    reserve_credit, refund_reservation, consume_reservation, LIVE_APPLY_CREDIT,
+)
+import asyncio
 from applier.greenhouse import apply_greenhouse
 from applier.lever import apply_lever
 from applier.ashby import apply_ashby
@@ -334,7 +338,7 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         # request and is NOT a reservation. We refund below if the apply
         # doesn't succeed, honoring the "no charge on bot failure" promise.
         if not dry_run:
-            credit_reserved = await deduct_credits(user_id, 0.4)
+            credit_reserved = await reserve_credit(user_id, job_id, LIVE_APPLY_CREDIT)
             if not credit_reserved:
                 print(f"  ✗ Insufficient credits for user {user_id} — skipping live apply")
                 await _set_step(user_id, job_id, "Insufficient credits — purchase more to apply")
@@ -394,13 +398,16 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
 
         # The credit was reserved (deducted) upfront. Refund it unless the
         # apply actually succeeded — "no charge on bot failure".
+        # refund_reservation is idempotent (flips the row flag atomically), so
+        # even if a safety net already refunded this row we can't double-pay.
         if credit_reserved and result != "applied":
-            from db import add_credits
-            await add_credits(user_id, 0.4)
+            if await refund_reservation(user_id, job_id, LIVE_APPLY_CREDIT):
+                print(f"  ↩ Refunded {LIVE_APPLY_CREDIT} credits (result={result})")
             credit_reserved = False
-            print(f"  ↩ Refunded 0.4 credits (result={result})")
         elif result == "applied" and not dry_run:
-            print(f"  ✓ Charged 0.4 credits from user {user_id}")
+            await consume_reservation(user_id, job_id)
+            credit_reserved = False
+            print(f"  ✓ Charged {LIVE_APPLY_CREDIT} credits from user {user_id}")
 
         try:
             from notifications import notify_application
@@ -417,6 +424,23 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         except Exception:
             pass
 
+    except asyncio.CancelledError:
+        # The queue drainer wraps us in asyncio.wait_for(APPLICATION_TIMEOUT)
+        # and a server shutdown cancels in-flight tasks — both surface here as
+        # CancelledError, which is a BaseException and therefore NEVER reached
+        # the `except Exception` branch below. The reserved credit was kept on
+        # every timeout. Refund (idempotently) and re-raise so wait_for still
+        # reports the timeout to the caller.
+        print(f"  ✗ Application cancelled (timeout or shutdown) user={user_id} job={job_id}")
+        if credit_reserved:
+            try:
+                if await refund_reservation(user_id, job_id, LIVE_APPLY_CREDIT):
+                    print(f"  ↩ Refunded {LIVE_APPLY_CREDIT} credits (apply cancelled)")
+                credit_reserved = False
+            except BaseException as _re:  # loop may be tearing down — best effort
+                print(f"  ⚠ Refund on cancel failed user={user_id} job={job_id}: "
+                      f"{type(_re).__name__}: {_re}")
+        raise
     except Exception as e:
         import traceback
         print(f"  ✗ Application error: {e}")
@@ -429,11 +453,12 @@ async def run_application(job: dict, user_id: int, dry_run: bool):
         # Refund the reserved credit — the apply errored, so no charge.
         if credit_reserved:
             try:
-                from db import add_credits
-                await add_credits(user_id, 0.4)
-                print(f"  ↩ Refunded 0.4 credits (apply errored)")
-            except Exception:
-                pass
+                if await refund_reservation(user_id, job_id, LIVE_APPLY_CREDIT):
+                    print(f"  ↩ Refunded {LIVE_APPLY_CREDIT} credits (apply errored)")
+                credit_reserved = False
+            except Exception as _re:
+                print(f"  ⚠ Refund on error failed user={user_id} job={job_id}: "
+                      f"{type(_re).__name__}: {_re}")
     finally:
         if tmp_resume_path and os.path.exists(tmp_resume_path):
             os.unlink(tmp_resume_path)

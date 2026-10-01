@@ -118,6 +118,42 @@ class ProfileUpdate(BaseModel):
     preferences: dict = {}
 
 
+# Preference keys that feed the AI scorer (matcher.build_profile_summary +
+# score_jobs). A PUT that changes none of these — e.g. the dashboard
+# persisting `dashboard_filters` on every chip click, or the IMAP settings —
+# must NOT trigger a 250-job Claude re-score (~$0.50 per save).
+SCORE_RELEVANT_PREF_KEYS = (
+    "skills", "job_title", "employer", "work_preference", "city", "state",
+    "salary_min", "salary_max", "work_auth", "keywords", "startup_experience",
+    "people_managed", "security_clearance", "languages", "job_categories",
+    "years_experience", "open_to_lower_level", "local_job_area",
+)
+
+
+def _norm_pref(v):
+    """Treat missing / None / '' / [] / {} as the same 'unset' value and make
+    containers order-insensitive where it doesn't change meaning."""
+    if v is None or v == "" or v == [] or v == {}:
+        return None
+    if isinstance(v, (list, dict)):
+        try:
+            return json.dumps(v, sort_keys=True)
+        except (TypeError, ValueError):
+            return repr(v)
+    return v
+
+
+def score_inputs_changed(existing: dict, merged: dict) -> bool:
+    """True if any score-relevant preference differs between the stored
+    prefs and the merged result of this PUT."""
+    existing = existing or {}
+    merged = merged or {}
+    return any(
+        _norm_pref(existing.get(k)) != _norm_pref(merged.get(k))
+        for k in SCORE_RELEVANT_PREF_KEYS
+    )
+
+
 @router.get("/")
 async def get_profile(user=Depends(get_current_user)):
     pool = await get_pool()
@@ -190,6 +226,7 @@ async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Dep
             # form fields the user changed take precedence, but non-form
             # keys survive.
             merged_prefs = {**(existing_prefs or {}), **prefs_in}
+            needs_rescore = score_inputs_changed(existing_prefs, merged_prefs)
             try:
                 prefs_encrypted = _merge_secret_prefs(merged_prefs, existing_prefs)
             except Exception as e:
@@ -208,11 +245,14 @@ async def update_profile(data: dict, background_tasks: BackgroundTasks, user=Dep
         print(f"  [PUT /profile/] DB UPDATE FAILED user={user_id}: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"DB error: {type(e).__name__}")
 
-    # Rescore all jobs in background using the updated profile
-    background_tasks.add_task(score_jobs, user_id, None, True)
+    # Rescore all jobs in background ONLY when something the scorer reads
+    # changed. Filter/IMAP/name-only saves skip the (paid) re-score.
+    if needs_rescore:
+        background_tasks.add_task(score_jobs, user_id, None, True)
     elapsed_ms = round((_t.perf_counter() - _t0) * 1000, 1)
-    print(f"  [PUT /profile/] OK user={user_id} in {elapsed_ms}ms (rescore queued)")
-    return {"status": "updated", "rescoring": True}
+    print(f"  [PUT /profile/] OK user={user_id} in {elapsed_ms}ms "
+          f"({'rescore queued' if needs_rescore else 'no score-relevant change, rescore skipped'})")
+    return {"status": "updated", "rescoring": needs_rescore}
 
 
 @router.post("/resume")
@@ -301,7 +341,7 @@ async def test_imap(request: Request, user=Depends(get_current_user)):
         # imaplib is synchronous + blocking; run it in a thread so a slow
         # Gmail handshake doesn't freeze the whole async event loop (and every
         # other request) for the duration of the login.
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail = imaplib.IMAP4_SSL("imap.gmail.com", timeout=30)
         mail.login(imap_user, imap_pass)
         mail.logout()
 
