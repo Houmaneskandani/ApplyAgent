@@ -805,6 +805,39 @@ async def apply_greenhouse(job: dict, dry_run: bool = True, user_info: dict = No
                         pass
                     return "failed"
 
+                # NO FORM AT ALL: every field below is located by id, so a
+                # page without #first_name (a closed posting on a company's
+                # own site, a throttled/blocked response, a crashed page) can
+                # only produce an empty form — which the reviewer then blocks
+                # as "no filled fields", parking a never-submitted application
+                # in Needs Review and putting the company in cooldown
+                # (2026-11-19: 4 such runs while a scrape ran in the same
+                # process). Wait for it, then fail honestly.
+                try:
+                    await frame.locator("input#first_name, input[name='first_name']").first.wait_for(
+                        state="attached", timeout=15000)
+                    has_form = True
+                except Exception:
+                    has_form = False
+                if not has_form:
+                    blob = ""
+                    for src in ([page] if frame is page else [page, frame]):
+                        try:
+                            blob += " " + (await src.evaluate(
+                                "(document.title || '') + ' ' + (document.body ? document.body.innerText : '')"))[:300]
+                        except Exception:
+                            pass
+                    blob = blob.lower()
+                    if "no longer open" in blob or "not found" in blob or "no longer available" in blob:
+                        note = "Greenhouse job posting is closed."
+                    else:
+                        note = (f"Not submitted: the application form never loaded "
+                                f"(page: {page.url[:80]}). Safe to retry.")
+                    print(f"    ✗ {note}")
+                    if info is not None:
+                        info["_reviewer_notes"] = note
+                    return "failed"
+
                 await fill_by_id(frame, "first_name", info.get("first_name", ""))
                 await fill_by_id(frame, "last_name", info.get("last_name", ""))
                 await fill_by_id(frame, "email", info.get("email", ""))

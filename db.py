@@ -123,6 +123,14 @@ async def init_db():
         # toggle and the rule-based scorer separate commodity local jobs from
         # career jobs without guessing from titles.
         await conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS category TEXT")
+        # 'us' | 'non_us' | 'unknown' from locations.job_region(), computed
+        # once at insert/backfill so SQL can keep a US user's feed, scoring and
+        # auto-apply inside the US without re-implementing the heuristic.
+        await conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS region TEXT")
+        # Bumped every time a scrape sees the posting again. Company boards
+        # list only OPEN jobs, so "not seen for N days" = closed. NULL on rows
+        # older than this column (treated as created_at).
+        await conn.execute("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMP")
         # Response Inbox — recruiter replies / interview invites / assessments
         # found in the user's Gmail (scanned by response_scanner.py).
         # UNIQUE(user_id, message_id) makes rescans idempotent.
@@ -205,16 +213,23 @@ async def insert_job(job: dict):
 async def insert_jobs_batch(jobs: list[dict]):
     if not jobs:
         return
+    from locations import job_region
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # A re-scraped posting is still open: bump last_seen_at. The
+        # description is only filled in when it was empty (unchanged rule).
         await conn.executemany(
             """
-            INSERT INTO jobs (title, company, location, url, source, description, category)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO jobs (title, company, location, url, source, description, category, region, last_seen_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
             ON CONFLICT (url) DO UPDATE
-              SET description = EXCLUDED.description
-              WHERE (jobs.description IS NULL OR jobs.description = '')
-                AND EXCLUDED.description != ''
+              SET last_seen_at = NOW(),
+                  region = COALESCE(jobs.region, EXCLUDED.region),
+                  description = CASE
+                      WHEN (jobs.description IS NULL OR jobs.description = '')
+                           AND EXCLUDED.description <> ''
+                      THEN EXCLUDED.description
+                      ELSE jobs.description END
             """,
             [
                 (
@@ -225,13 +240,73 @@ async def insert_jobs_batch(jobs: list[dict]):
                     j["source"],
                     j.get("description", ""),
                     j.get("category"),
+                    job_region(j.get("location")),
                 )
                 for j in jobs
             ],
         )
 
 
-async def get_unscored_jobs(user_id: int, rescore: bool = False, limit: int = None):
+async def backfill_job_regions(batch: int = 5000) -> int:
+    """Classify rows inserted before jobs.region existed. Idempotent; cheap
+    once done (only touches region IS NULL)."""
+    from locations import job_region
+    pool = await get_pool()
+    done = 0
+    async with pool.acquire() as conn:
+        while True:
+            rows = await conn.fetch(
+                "SELECT id, location FROM jobs WHERE region IS NULL ORDER BY id LIMIT $1", batch)
+            if not rows:
+                break
+            await conn.execute(
+                """
+                UPDATE jobs SET region = v.region
+                  FROM (SELECT UNNEST($1::int[]) AS id, UNNEST($2::text[]) AS region) v
+                 WHERE jobs.id = v.id
+                """,
+                [r["id"] for r in rows], [job_region(r["location"]) for r in rows],
+            )
+            done += len(rows)
+            if len(rows) < batch:
+                break
+    return done
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        return default
+
+
+# Freshness for the browse list, auto-apply and scoring. A posting counts as
+# live while a scrape has seen it in the last JOB_SEEN_WITHIN_DAYS (boards
+# list only open jobs), and it stops being "new" JOB_MAX_AGE_DAYS after we
+# first found it. Without this the list was ranked over ALL history, so
+# March–August postings (most long closed) filled the first page.
+JOB_SEEN_WITHIN_DAYS = _positive_int_env("JOB_SEEN_WITHIN_DAYS", 14)
+JOB_MAX_AGE_DAYS = _positive_int_env("JOB_MAX_AGE_DAYS", 60)
+
+
+def fresh_job_sql(alias: str = "j") -> str:
+    """SQL predicate: posting still open and first seen recently. The day
+    counts are ints parsed above, so the interpolation is injection-safe."""
+    return (
+        f"(COALESCE({alias}.last_seen_at, {alias}.created_at) > NOW() - INTERVAL '{JOB_SEEN_WITHIN_DAYS} days'"
+        f" AND {alias}.created_at > NOW() - INTERVAL '{JOB_MAX_AGE_DAYS} days')"
+    )
+
+
+def us_region_sql(alias: str = "j", strict: bool = False) -> str:
+    """SQL predicate: US or unclassifiable ("Remote") postings. strict=True
+    (auto-apply) also drops rows not yet classified (region IS NULL)."""
+    fallback = "pending" if strict else "unknown"
+    return f"COALESCE({alias}.region, '{fallback}') IN ('us', 'unknown')"
+
+
+async def get_unscored_jobs(user_id: int, rescore: bool = False, limit: int = None,
+                            us_only: bool = False):
     # Score the FRESHEST jobs first. Previously there was no ORDER BY, so with
     # a backlog of unscored rows the DB returned an arbitrary (effectively
     # oldest-by-insertion) slice — newly-scraped postings could starve and
@@ -240,20 +315,25 @@ async def get_unscored_jobs(user_id: int, rescore: bool = False, limit: int = No
     # clears its backlog in fewer passes.
     if limit is None:
         try:
-            limit = int(os.getenv("MATCHER_SCORE_LIMIT", "250"))
+            limit = int(os.getenv("MATCHER_SCORE_LIMIT", "1000"))
         except ValueError:
-            limit = 250
+            limit = 1000
     pool = await get_pool()
     async with pool.acquire() as conn:
         if rescore:
             return await conn.fetch(
                 "SELECT * FROM jobs ORDER BY created_at DESC LIMIT $1", limit
             )
+        # Only score what the user could actually see or auto-apply to:
+        # still-open, recent postings (and US ones for a US user). Scoring
+        # closed or out-of-country jobs was pure API spend.
+        region_sql = f" AND {us_region_sql('j')}" if us_only else ""
         return await conn.fetch(
-            """
+            f"""
             SELECT j.* FROM jobs j
             LEFT JOIN applications a ON a.job_id = j.id AND a.user_id = $1
-            WHERE a.id IS NULL OR a.score IS NULL
+            WHERE (a.id IS NULL OR a.score IS NULL)
+              AND {fresh_job_sql('j')}{region_sql}
             ORDER BY j.created_at DESC
             LIMIT $2
             """,

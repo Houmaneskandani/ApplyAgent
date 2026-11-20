@@ -108,10 +108,17 @@ async def get_jobs(
     title: str | None = None,
     exclude_attempted: bool = False,
     exclude_companies: str | None = None,
+    include_international: bool = False,
+    include_stale: bool = False,
     user=Depends(get_current_user),
 ):
     """
     List the user's top-scored jobs.
+
+    Browse views (status None/'new') show only postings still open and first
+    seen in the last JOB_MAX_AGE_DAYS, and — for a user whose profile country
+    is the US — only US / "Remote" postings. `include_stale` /
+    `include_international` turn those off.
 
     Optional server-side filters — ALL applied BEFORE the score-DESC LIMIT so
     they search the user's WHOLE scored set, not just the top-N slice the
@@ -164,6 +171,23 @@ async def get_jobs(
         # NULL score, and `score >= 1` would silently hide them.
         if status_filter in (None, "new"):
             where.append(f"a.score >= {_bind(min_score)}")
+            # Browse = postings still open and recent (not the whole history,
+            # whose old 9s buried every new job), and US-only for a US user.
+            # History tabs keep showing everything.
+            from db import fresh_job_sql, us_region_sql
+            if not include_stale:
+                where.append(fresh_job_sql("j"))
+            if not include_international:
+                from locations import us_only_for
+                import json as _json
+                prefs = await conn.fetchval("SELECT preferences FROM users WHERE id = $1", user_id) or {}
+                if isinstance(prefs, str):
+                    try:
+                        prefs = _json.loads(prefs)
+                    except ValueError:
+                        prefs = {}
+                if us_only_for(prefs):
+                    where.append(us_region_sql("j"))
 
         # "Don't show me what I already applied to" — hides jobs whose exact
         # company+title matches ANY already-attempted application, catching

@@ -5,6 +5,17 @@ import time
 
 DAILY_LIMIT = 10
 MIN_SCORE = 6  # bot won't auto-apply to anything weaker than this
+# Upper bound on eligible rows one auto-apply pass pages through looking for
+# ones that pass the saved filters.
+AUTO_APPLY_MAX_SCAN = int(os.getenv("AUTO_APPLY_MAX_SCAN", "2000"))
+
+# Scrapes currently running in THIS process ("Find new jobs" runs one inside
+# the API service, next to the apply browser).
+_SCRAPES_RUNNING = 0
+
+
+def scrape_in_progress() -> bool:
+    return _SCRAPES_RUNNING > 0
 
 # Heartbeat for the always-on auto_apply_loop. Sentry's FastAPI integration
 # only captures exceptions raised inside REQUEST handlers — a background loop
@@ -182,8 +193,8 @@ async def auto_apply_for_user(user_id: int) -> int:
     Strategy:
       1. Check daily/queue limits.
       2. Read user.preferences.dashboard_filters.
-      3. SQL-fetch a wide pool of top-scored 'new' candidates.
-      4. Walk the pool in score-DESC order; pick the first N that pass
+      3. SQL-filter eligible 'new' candidates (open, recent, US, ATS, ...).
+      4. Page through them in score-DESC order; pick the first N that pass
          the saved filters.
     """
     from db import get_pool, add_to_queue
@@ -220,7 +231,7 @@ async def auto_apply_for_user(user_id: int) -> int:
                     prefs_raw = {}
             filters = (prefs_raw or {}).get("dashboard_filters") or {}
 
-            pool_size = max(remaining * 5, 30)
+            page_size = max(remaining * 5, 50)
             # ELIGIBILITY FILTERS RUN IN SQL, BEFORE THE LIMIT. The pool used
             # to be "top-N by score, then filter in Python" — the same
             # filter-after-truncation bug the dashboard had: once the top-50
@@ -300,17 +311,24 @@ async def auto_apply_for_user(user_id: int) -> int:
                 args.append([f"%{w}%" for w in _wl])
                 order_prefix = f"(LOWER(COALESCE(j.company, '')) LIKE ANY(${len(args)})) DESC, "
 
-            args.append(pool_size)
-            candidates = await conn.fetch(f"""
-                SELECT a.job_id, a.score,
-                       j.title, j.company, j.location, j.description,
-                       j.url, j.source
-                  FROM applications a
-                  JOIN jobs j ON j.id = a.job_id
-                 WHERE {' AND '.join(where)}
-                 ORDER BY {order_prefix}a.score DESC, j.created_at DESC
-                 LIMIT ${len(args)}
-            """, *args)
+            # Only postings that are still open and recent, and — for a US
+            # user — in the US. strict=True: a row not yet classified is never
+            # auto-applied (applying abroad is not reversible).
+            from db import fresh_job_sql, us_region_sql
+            from locations import us_only_for
+            where.append(fresh_job_sql("j"))
+            if us_only_for(prefs_raw):
+                where.append(us_region_sql("j", strict=True))
+            # Internships require current enrollment — never auto-apply an
+            # experienced candidate to one (a "2027 Summer Intern, Software
+            # Engineer" posting matched the 'software engineer' role and
+            # scored 6 because lower-level roles aren't penalized).
+            try:
+                _yrs = int(str((prefs_raw or {}).get("years_experience") or "0").strip() or "0")
+            except ValueError:
+                _yrs = 0
+            if _yrs >= 1:
+                where.append(r"j.title !~* '\m(intern|interns|internship|co-op)\M'")
 
             # Dedupe by (company, title): companies re-post the SAME role per
             # location/board (observed live: 4 identical Brex postings queued
@@ -328,40 +346,63 @@ async def auto_apply_for_user(user_id: int) -> int:
             """, user_id)
             seen_pairs = {(r["c"], r["t"]) for r in attempted}
 
-        if not candidates:
+            # Gate the autonomous path by ATS allowlist. Skipping non-allowlisted
+            # jobs HERE (before they're queued) — not after — avoids a re-queue
+            # loop where the drainer keeps picking the same blocked job.
+            from api.routes.jobs import classify_ats
+            allow_all = "*" in allowlist
+
+            matching: list = []
+            skipped_ats: dict = {}
+            skipped_dupes = 0
+            batch_companies: set = set()  # ONE application per company per batch —
+            # SQL cooldown can't see rows queued in THIS pass, so without this a
+            # single cycle could queue 10 different roles at the same company.
+
+            # The saved filters (experience level, work type, ...) are Python
+            # heuristics, so PAGE through the SQL-eligible rows until enough
+            # pass. A fixed top-N slice starved forever whenever every top row
+            # failed them (2026-11: 182 eligible, 10 passing the Entry–Mid
+            # experience filter, none of them in the top 50 → 0 queued for weeks).
+            scanned = 0
+            while len(matching) < remaining and scanned < AUTO_APPLY_MAX_SCAN:
+                page = await conn.fetch(f"""
+                    SELECT a.job_id, a.score,
+                           j.title, j.company, j.location, j.description,
+                           j.url, j.source
+                      FROM applications a
+                      JOIN jobs j ON j.id = a.job_id
+                     WHERE {' AND '.join(where)}
+                     ORDER BY {order_prefix}a.score DESC, j.created_at DESC, a.job_id
+                     LIMIT ${len(args) + 1} OFFSET ${len(args) + 2}
+                """, *args, page_size, scanned)
+                if not page:
+                    break
+                scanned += len(page)
+                for job in page:
+                    if not allow_all:
+                        bucket = classify_ats(job["source"], job["url"])
+                        if bucket not in allowlist:
+                            skipped_ats[bucket] = skipped_ats.get(bucket, 0) + 1
+                            continue
+                    pair = ((job["company"] or "").lower(), (job["title"] or "").lower())
+                    if pair[0] and (pair in seen_pairs or pair[0] in batch_companies):
+                        skipped_dupes += 1
+                        continue
+                    if _job_passes_saved_filters(dict(job), filters):
+                        seen_pairs.add(pair)
+                        if pair[0]:
+                            batch_companies.add(pair[0])
+                        matching.append(job)
+                        if len(matching) >= remaining:
+                            break
+                if len(page) < page_size:
+                    break
+
+        if not scanned:
             print(f"  [AutoApply] User {user_id}: no qualifying new jobs (score >= {MIN_SCORE}, status = new)")
             return 0
 
-        # Gate the autonomous path by ATS allowlist. Skipping non-allowlisted
-        # jobs HERE (before they're queued) — not after — avoids a re-queue
-        # loop where the drainer keeps picking the same blocked job.
-        from api.routes.jobs import classify_ats
-        allowlist = _live_apply_allowlist()
-        allow_all = "*" in allowlist
-
-        matching: list = []
-        skipped_ats: dict = {}
-        skipped_dupes = 0
-        batch_companies: set = set()  # ONE application per company per batch —
-        # SQL cooldown can't see rows queued in THIS pass, so without this a
-        # single cycle could queue 10 different roles at the same company.
-        for job in candidates:
-            if not allow_all:
-                bucket = classify_ats(job["source"], job["url"])
-                if bucket not in allowlist:
-                    skipped_ats[bucket] = skipped_ats.get(bucket, 0) + 1
-                    continue
-            pair = ((job["company"] or "").lower(), (job["title"] or "").lower())
-            if pair[0] and (pair in seen_pairs or pair[0] in batch_companies):
-                skipped_dupes += 1
-                continue
-            if _job_passes_saved_filters(dict(job), filters):
-                seen_pairs.add(pair)
-                if pair[0]:
-                    batch_companies.add(pair[0])
-                matching.append(job)
-                if len(matching) >= remaining:
-                    break
         if skipped_dupes:
             print(f"  [AutoApply] User {user_id}: skipped {skipped_dupes} duplicate company+title posting(s)")
 
@@ -375,13 +416,13 @@ async def auto_apply_for_user(user_id: int) -> int:
         if not matching:
             active_filter_keys = [k for k, v in filters.items() if v and v != [] and v != ""]
             print(
-                f"  [AutoApply] User {user_id}: {len(candidates)} candidates "
-                f"in pool, 0 passed saved filters {active_filter_keys}"
+                f"  [AutoApply] User {user_id}: {scanned} candidates "
+                f"scanned, 0 passed saved filters {active_filter_keys}"
             )
             return 0
 
         filter_note = (
-            f" (filtered to {len(matching)} from {len(candidates)} candidates)"
+            f" (filtered to {len(matching)} from {scanned} candidates scanned)"
             if filters else ""
         )
         print(
@@ -475,13 +516,25 @@ async def run_scrape_and_score():
             return 0
 
     print("\n[Scraper] Starting scrape (all sources in parallel)...")
-    results = await asyncio.gather(*[run_one(n, f) for n, f in scrapers])
+    # Applies in this process wait while the scrape runs (see
+    # scrape_in_progress): every Greenhouse form loaded during a scrape burst
+    # came back empty, and those applies were parked as never-submitted.
+    global _SCRAPES_RUNNING
+    _SCRAPES_RUNNING += 1
+    try:
+        results = await asyncio.gather(*[run_one(n, f) for n, f in scrapers])
+    finally:
+        _SCRAPES_RUNNING -= 1
     print(f"[Scraper] Done — {sum(results)} total jobs scraped.")
 
     # Score the freshly-scraped jobs for every user, otherwise they keep
     # score=NULL and can never satisfy the auto-apply score>=6 bar. (This was
     # the missing step that made scheduler-scraped jobs un-auto-appliable.)
     from matcher import score_jobs
+    # `pool` was never assigned here, so "Find new jobs" scraped and then
+    # died with a NameError before scoring anything — new jobs stayed
+    # unscored and therefore invisible on the dashboard.
+    pool = await get_pool()
     async with pool.acquire() as conn:
         users = await conn.fetch("SELECT id FROM users")
     print(f"[Scraper] Scoring for {len(users)} user(s)...")

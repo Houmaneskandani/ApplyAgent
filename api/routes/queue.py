@@ -38,6 +38,23 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
     return _user_locks[user_id]
 
 
+async def _wait_for_scrape_to_finish(max_wait_s: int = 900):
+    """Hold applies (before claiming a row, so nothing sits in 'applying')
+    while a scrape runs in this process. All four applies started during the
+    2026-11-19 "Find new jobs" scrape loaded pages without a form; none of
+    147 earlier successes overlapped a scrape. Gives up waiting after 15 min."""
+    try:
+        from scheduler import scrape_in_progress
+    except Exception:
+        return
+    waited = 0
+    while scrape_in_progress() and waited < max_wait_s:
+        if waited == 0:
+            print("  [Queue] A job scrape is running — holding applies until it finishes")
+        await asyncio.sleep(10)
+        waited += 10
+
+
 async def process_user_queue(user_id: int):
     """
     Drain the queued applications for a user, one at a time.
@@ -62,6 +79,7 @@ async def process_user_queue(user_id: int):
         # Drain the queue serially. New rows added while we're processing
         # also get picked up here (the SELECT runs every iteration).
         while True:
+            await _wait_for_scrape_to_finish()
             pool = await get_pool()
             async with pool.acquire() as conn:
                 # Atomic claim: SELECT a single queued row with FOR UPDATE

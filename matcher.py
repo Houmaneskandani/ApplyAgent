@@ -297,22 +297,39 @@ Reply with ONLY a single integer (0-10). Nothing else."""
 
 # ── Main scorer ────────────────────────────────────────────────────────────
 
-async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = False):
-    jobs = await get_unscored_jobs(user_id, rescore=rescore)
+def _has_matching_profile(prefs: dict) -> bool:
+    """Anything to score a job against besides a résumé?"""
+    return bool(prefs.get("job_title") or prefs.get("skills") or prefs.get("job_categories"))
 
-    # Load full user info (prefs + resume_url)
+
+async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = False):
+    # Load full user info (prefs + resume_url) BEFORE fetching jobs: accounts
+    # with nothing to match against are skipped outright.
     pool = await get_pool()
     async with pool.acquire() as conn:
         import json
         row = await conn.fetchrow(
             "SELECT name, preferences, resume_url FROM users WHERE id = $1", user_id
         )
-    user = {"name": row["name"]} if row else {}
-    prefs_raw = row["preferences"] if row else {}
+    if not row:
+        return
+    user = {"name": row["name"]}
+    prefs_raw = row["preferences"]
     if isinstance(prefs_raw, str):
         prefs_raw = json.loads(prefs_raw) if prefs_raw else {}
     prefs = prefs_raw or {}
-    resume_url = row["resume_url"] if row else None
+    resume_url = row["resume_url"]
+
+    # No résumé AND no profile = every score would be a guess against an
+    # empty profile. Seven such sign-up-and-leave accounts consumed ~85% of
+    # all scoring calls (2026-11 audit) — skip them.
+    if not resume_url and not _has_matching_profile(prefs):
+        print(f"  Skipping user {user_id}: no résumé and no profile to match against")
+        return
+
+    from locations import us_only_for, job_region
+    us_only = us_only_for(prefs)
+    jobs = await get_unscored_jobs(user_id, rescore=rescore, us_only=us_only)
 
     # Per-user resume only. NEVER fall back to a committed local resume.pdf —
     # that would score one user's jobs against another user's resume, which is
@@ -362,7 +379,7 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
         open_low = any(c != "software_engineering" for c in _cats)
     sem = asyncio.Semaphore(SCORE_CONCURRENCY)
 
-    counters = {"scored": 0, "errored": 0, "skipped": 0}
+    counters = {"scored": 0, "errored": 0, "skipped": 0, "outside_us": 0}
 
     # Local commodity categories (warehouse/temp) are scored by RULE, not by
     # Claude — the fit question is "right title, right place", which a
@@ -391,6 +408,12 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     async def score_one(job):
         job_dict = dict(job)
         title = job_dict.get("title", "")
+        # Outside the US for a US-only user: never shown or auto-applied, so
+        # no AI call and no row (the SQL already excludes classified rows;
+        # this catches any not yet classified).
+        if us_only and job_region(job_dict.get("location")) == "non_us":
+            counters["outside_us"] += 1
+            return
         # Local commodity job (tagged by the scraper that found it): rule-based
         # score, zero Claude tokens. Only when this user actually opted into
         # the category — otherwise it's 0 like any other non-target job.
@@ -447,7 +470,8 @@ async def score_jobs(user_id: int, resume_path: str = None, rescore: bool = Fals
     print(
         f"\n  Done — scored OK: {counters['scored']}  |  "
         f"errored (defaulted to 5): {counters['errored']}  |  "
-        f"skipped (not engineering): {counters['skipped']}"
+        f"skipped (not engineering): {counters['skipped']}  |  "
+        f"skipped (outside US): {counters['outside_us']}"
     )
     if err_warning:
         print(err_warning)

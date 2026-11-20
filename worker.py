@@ -21,6 +21,16 @@ async def main():
     print("=== Worker: scrape + score ===")
     await init_db()
 
+    # Classify any job rows that predate jobs.region (US-only feed). Cheap
+    # no-op once everything is classified; new rows get it at insert.
+    try:
+        from db import backfill_job_regions
+        n = await backfill_job_regions()
+        if n:
+            print(f"  Classified region for {n} older job(s)")
+    except Exception as e:
+        print(f"  Region backfill failed: {type(e).__name__}: {e}")
+
     # Resolve which categories to search + the local area BEFORE scraping.
     # Without this the cron scraped with the software-only default no matter
     # what categories users picked (the resolve only lived in scheduler_loop,
